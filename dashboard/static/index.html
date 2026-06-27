@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0" />
+  <title>Prophet</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg:            #080c10;
+      --bg-panel:      #0d1117;
+      --bg-hover:      #161b22;
+      --border:        #21262d;
+      --border-bright: #30363d;
+      --text:          #e6edf3;
+      --muted:         #7d8590;
+      --dim:           #484f58;
+      --green:         #3fb950;
+      --green-bg:      rgba(63,185,80,0.12);
+      --red:           #f85149;
+      --red-bg:        rgba(248,81,73,0.12);
+      --amber:         #d29922;
+      --blue:          #58a6ff;
+      --purple:        #bc8cff;
+      --mono:          'Space Mono', monospace;
+      --sans:          'DM Sans', sans-serif;
+      --r:             8px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+    body { background: var(--bg); color: var(--text); font-family: var(--sans); font-size: 14px; line-height: 1.6; min-height: 100vh; }
+    ::-webkit-scrollbar { width: 3px; height: 3px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border-bright); border-radius: 2px; }
+
+    /* Header */
+    #header { position: sticky; top: 0; z-index: 200; background: var(--bg-panel); border-bottom: 1px solid var(--border); }
+    .header-top { display: flex; align-items: center; justify-content: space-between; padding: 0 16px; height: 50px; }
+    .wordmark { font-family: var(--mono); font-weight: 700; font-size: 13px; letter-spacing: 3px; color: var(--green); }
+    .header-right { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+    .total-pnl { font-family: var(--mono); font-size: 13px; font-weight: 700; }
+    .refresh-btn { background: var(--bg-hover); border: 1px solid var(--border); color: var(--muted); padding: 5px 10px; border-radius: 4px; cursor: pointer; font-size: 14px; touch-action: manipulation; }
+    .live-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--green); animation: pulse 2s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1}50%{opacity:.3} }
+    .nav-strip { display: flex; gap: 2px; padding: 4px 12px 8px; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+    .nav-strip::-webkit-scrollbar { display: none; }
+    nav button { background: transparent; border: none; color: var(--muted); padding: 5px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; font-family: var(--sans); white-space: nowrap; flex-shrink: 0; touch-action: manipulation; }
+    nav button.active { background: var(--bg-hover); color: var(--text); font-weight: 500; }
+
+    /* Layout */
+    main { padding: 12px; max-width: 1400px; margin: 0 auto; }
+    .page { display: none; flex-direction: column; gap: 12px; }
+    .page.active { display: flex; }
+    .panel { background: var(--bg-panel); border: 1px solid var(--border); border-radius: var(--r); padding: 16px; }
+    .panel-title { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 14px; }
+
+    /* Stats */
+    .stats-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+    .stat { background: var(--bg-panel); border: 1px solid var(--border); border-radius: var(--r); padding: 12px 14px; }
+    .stat-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 5px; }
+    .stat-value { font-family: var(--mono); font-size: 17px; font-weight: 700; line-height: 1.2; }
+    .stat-sub { font-size: 11px; color: var(--muted); margin-top: 3px; }
+
+    /* Colors */
+    .green { color: var(--green); } .red { color: var(--red); } .amber { color: var(--amber); } .muted { color: var(--muted); } .mono { font-family: var(--mono); }
+
+    /* Tags */
+    .tag { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 11px; font-weight: 500; }
+    .tag-green { background: var(--green-bg); color: var(--green); }
+    .tag-red { background: var(--red-bg); color: var(--red); }
+    .tag-muted { background: var(--bg-hover); color: var(--muted); }
+
+    /* Cards for positions/trades on mobile */
+    .trade-card { background: var(--bg-hover); border: 1px solid var(--border); border-radius: var(--r); padding: 12px; margin-bottom: 8px; }
+    .trade-card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+    .trade-card-sym { font-family: var(--mono); font-size: 16px; font-weight: 700; }
+    .trade-card-pnl { font-family: var(--mono); font-size: 15px; font-weight: 700; }
+    .trade-card-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 10px; }
+    .tc-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.4px; }
+    .tc-value { font-family: var(--mono); font-size: 12px; margin-top: 1px; }
+
+    /* Desktop table */
+    .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    table { width: 100%; border-collapse: collapse; min-width: 580px; }
+    th { text-align: left; padding: 0 12px 10px 0; font-size: 10px; color: var(--muted); font-weight: 500; text-transform: uppercase; letter-spacing: 0.5px; white-space: nowrap; }
+    td { padding: 9px 12px 9px 0; border-top: 1px solid var(--border); font-size: 13px; }
+    tr:hover td { background: var(--bg-hover); }
+
+    /* Decision cards */
+    .decision-card { background: var(--bg-panel); border: 1px solid var(--border); border-radius: var(--r); padding: 12px 14px; border-left-width: 3px; margin-bottom: 8px; }
+    .decision-header { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; margin-bottom: 6px; }
+    .agent-label { font-family: var(--mono); font-size: 11px; font-weight: 700; text-transform: uppercase; }
+    .decision-type { font-size: 11px; background: var(--bg-hover); color: var(--muted); padding: 2px 7px; border-radius: 4px; }
+    .decision-time { font-size: 11px; color: var(--dim); }
+    .decision-body { font-size: 13px; line-height: 1.6; }
+    details summary { font-size: 11px; color: var(--muted); cursor: pointer; margin-top: 8px; user-select: none; }
+    pre { margin-top: 6px; padding: 10px; background: var(--bg); border-radius: 6px; font-size: 10px; color: var(--muted); overflow-x: auto; font-family: var(--mono); line-height: 1.5; }
+
+    /* Filter tabs */
+    .filter-tabs { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 2px; scrollbar-width: none; }
+    .filter-tabs::-webkit-scrollbar { display: none; }
+    .filter-tab { background: transparent; border: 1px solid var(--border); color: var(--muted); padding: 5px 12px; border-radius: 6px; cursor: pointer; font-size: 12px; font-family: var(--sans); white-space: nowrap; flex-shrink: 0; touch-action: manipulation; }
+    .filter-tab.active { background: var(--bg-hover); border-color: var(--border-bright); color: var(--text); }
+
+    /* Journal */
+    .journal-card { background: var(--bg-panel); border: 1px solid var(--border); border-radius: var(--r); padding: 14px 16px; margin-bottom: 10px; }
+    .journal-header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; margin-bottom: 10px; }
+    .journal-sym { font-family: var(--mono); font-size: 17px; font-weight: 700; }
+    .journal-pnl { font-family: var(--mono); font-size: 14px; font-weight: 700; }
+    .journal-date { font-size: 11px; color: var(--dim); margin-left: auto; }
+    .scores { display: flex; gap: 14px; margin-bottom: 12px; }
+    .score-item { display: flex; align-items: center; gap: 5px; }
+    .score-dot { width: 26px; height: 26px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-family: var(--mono); font-size: 11px; font-weight: 700; border: 2px solid; }
+    .score-lbl { font-size: 11px; color: var(--muted); }
+    .j-section { margin-bottom: 10px; }
+    .j-section-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 3px; }
+    .j-section-body { font-size: 13px; line-height: 1.6; }
+
+    /* Empty */
+    .empty { color: var(--muted); font-size: 13px; padding: 32px 0; text-align: center; }
+    #loading { display: flex; align-items: center; justify-content: center; height: 50vh; color: var(--muted); font-family: var(--mono); font-size: 12px; }
+
+    /* Desktop overrides */
+    @media (min-width: 641px) {
+      main { padding: 20px; }
+      .header-top { padding: 0 24px; }
+      .nav-strip { padding: 4px 20px 8px; }
+      .stats-grid { grid-template-columns: repeat(5, 1fr); gap: 10px; }
+      .stat { padding: 14px 18px; }
+      .stat-value { font-size: 20px; }
+      .trade-card-grid { grid-template-columns: repeat(4, 1fr); }
+      .panel { padding: 18px 22px; }
+      .decision-time { margin-left: auto; }
+    }
+  </style>
+</head>
+<body>
+<div id="header">
+  <div class="header-top">
+    <span class="wordmark">PROPHET</span>
+    <div class="header-right">
+      <span class="total-pnl" id="header-pnl">—</span>
+      <span class="live-dot"></span>
+      <span id="last-refresh" style="display:none;font-size:11px"></span>
+      <button class="refresh-btn" onclick="fetchAll()">↻</button>
+    </div>
+  </div>
+  <div class="nav-strip">
+    <nav>
+      <button class="active" onclick="showPage('overview')">Overview</button>
+      <button onclick="showPage('trades')">Trades</button>
+      <button onclick="showPage('performance')">Performance</button>
+      <button onclick="showPage('decisions')">Decisions</button>
+      <button onclick="showPage('journal')">Journal</button>
+    </nav>
+  </div>
+</div>
+
+<main>
+  <div id="loading">Loading Prophet...</div>
+
+  <div id="page-overview" class="page">
+    <div class="stats-grid" id="stats-grid"></div>
+    <div class="panel">
+      <div class="panel-title">Equity Curve</div>
+      <canvas id="equity-chart"></canvas>
+      <div id="equity-empty" class="empty" style="display:none">Chart appears after the first trading day</div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">Open Positions</div>
+      <div id="positions-out"></div>
+    </div>
+  </div>
+
+  <div id="page-trades" class="page">
+    <div class="stats-grid" id="trades-summary" style="grid-template-columns:repeat(2,1fr)"></div>
+    <div class="panel">
+      <div class="panel-title">Trade History</div>
+      <div id="trades-out"></div>
+    </div>
+  </div>
+
+  <div id="page-performance" class="page">
+    <div class="stats-grid" id="perf-summary" style="grid-template-columns:repeat(3,1fr)"></div>
+    <div class="panel" id="winrate-panel">
+      <div class="panel-title">Win Rate by Setup</div>
+      <canvas id="winrate-chart"></canvas>
+    </div>
+    <div class="panel">
+      <div class="panel-title">Strategy Breakdown</div>
+      <div id="perf-out"></div>
+    </div>
+  </div>
+
+  <div id="page-decisions" class="page">
+    <div class="filter-tabs" id="decision-filters"></div>
+    <div id="decisions-out"></div>
+  </div>
+
+  <div id="page-journal" class="page">
+    <div id="journal-out"></div>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id)
+let S = {portfolio:null,positions:[],trades:[],performance:null,decisions:[],journal:[],history:[]}
+let eqChart=null, wrChart=null, dFilter='all', curPage='overview'
+const mobile = () => window.innerWidth <= 640
+
+const fmtUSD = n => n==null?'—':`$${Math.abs(n).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})}`
+const fmtPnl = n => n==null?'—':`${n>=0?'+':'-'}${fmtUSD(n)}`
+const pCls   = n => n>=0?'green':'red'
+const fmtD   = s => s?new Date(s).toLocaleDateString('en-US',{month:'short',day:'numeric'}):'—'
+const fmtT   = s => s?new Date(s).toLocaleString('en-US',{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'}):'—'
+const esc    = s => s?String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'):''
+
+async function fetchAll() {
+  try {
+    const [port,pos,tr,perf,dec,jour,hist] = await Promise.all([
+      fetch('/api/portfolio').then(r=>r.json()),
+      fetch('/api/positions').then(r=>r.json()),
+      fetch('/api/trades?limit=100').then(r=>r.json()),
+      fetch('/api/performance').then(r=>r.json()),
+      fetch('/api/decisions?limit=50').then(r=>r.json()),
+      fetch('/api/journal?limit=20').then(r=>r.json()),
+      fetch('/api/portfolio/history?days=30').then(r=>r.json()),
+    ])
+    S={portfolio:port,positions:pos,trades:tr,performance:perf,decisions:dec,journal:jour,history:hist}
+    $('loading').style.display='none'
+    $(`page-${curPage}`).classList.add('active')
+    const lr=$('last-refresh'); lr.style.display='inline'
+    lr.textContent=new Date().toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'})
+    render()
+  } catch(e){ console.error(e) }
+}
+
+function showPage(name) {
+  document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'))
+  document.querySelectorAll('nav button').forEach(b=>b.classList.remove('active'))
+  $(`page-${name}`).classList.add('active')
+  document.querySelectorAll('nav button')[['overview','trades','performance','decisions','journal'].indexOf(name)].classList.add('active')
+  curPage=name; render()
+}
+
+function render() {
+  renderHeader()
+  const m={overview:renderOverview,trades:renderTrades,performance:renderPerf,decisions:renderDecisions,journal:renderJournal}
+  if(m[curPage]) m[curPage]()
+}
+
+function renderHeader() {
+  const p=S.portfolio; if(!p) return
+  const el=$('header-pnl')
+  el.textContent=fmtPnl(p.total_pnl)
+  el.className=`total-pnl ${pCls(p.total_pnl)}`
+}
+
+/* ── Overview ── */
+function renderOverview() {
+  const p=S.portfolio; if(!p) return
+  const wins=S.trades.filter(t=>t.pnl>0).length, tot=S.trades.length, wr=tot>0?Math.round(wins/tot*100):0
+  $('stats-grid').innerHTML=[
+    {l:'Value',    v:`$${(p.equity||0).toLocaleString('en-US',{minimumFractionDigits:2})}`, s:'Paper account'},
+    {l:'Total P&L',v:fmtPnl(p.total_pnl), s:`${(p.total_pnl_pct??0)>=0?'+':''}${(p.total_pnl_pct??0).toFixed(2)}%`, c:pCls(p.total_pnl)},
+    {l:'Today',    v:fmtPnl(p.daily_pnl), c:pCls(p.daily_pnl)},
+    {l:'Positions',v:S.positions.length,   s:`${fmtUSD(p.buying_power)} avail`},
+    {l:'Win Rate', v:`${wr}%`,             s:`${wins}/${tot} trades`, c:wr>=50?'green':'amber'},
+  ].map(s=>`<div class="stat"><div class="stat-label">${s.l}</div><div class="stat-value ${s.c||''}">${s.v}</div>${s.s?`<div class="stat-sub">${s.s}</div>`:''}</div>`).join('')
+
+  const hist=S.history
+  if(hist.length>1) {
+    $('equity-empty').style.display='none'
+    if(eqChart) eqChart.destroy()
+    const ctx=$('equity-chart').getContext('2d')
+    const gr=ctx.createLinearGradient(0,0,0,160); gr.addColorStop(0,'rgba(63,185,80,.15)'); gr.addColorStop(1,'rgba(63,185,80,0)')
+    eqChart=new Chart(ctx,{type:'line',data:{
+      labels:hist.map(h=>new Date(h.timestamp).toLocaleDateString('en-US',{month:'short',day:'numeric'})),
+      datasets:[{data:hist.map(h=>h.equity),borderColor:'#3fb950',borderWidth:2,backgroundColor:gr,fill:true,pointRadius:0,tension:.4}]},
+      options:{responsive:true,maintainAspectRatio:true,plugins:{legend:{display:false},tooltip:{callbacks:{label:v=>`$${v.raw.toLocaleString()}`},displayColors:false,backgroundColor:'#0d1117',borderColor:'#21262d',borderWidth:1}},
+               scales:{x:{grid:{color:'#21262d22'},ticks:{color:'#7d8590',font:{size:10},maxTicksLimit:6}},y:{grid:{color:'#21262d22'},ticks:{color:'#7d8590',font:{size:10},callback:v=>`$${(v/1000).toFixed(0)}k`}}}}})
+  } else { $('equity-empty').style.display='block' }
+
+  const pos=S.positions
+  $('positions-out').innerHTML=pos.length===0?'<div class="empty">No open positions</div>':mobile()?
+    pos.map(p=>`<div class="trade-card">
+      <div class="trade-card-header">
+        <div><span class="trade-card-sym">${esc(p.symbol)}</span> <span class="tag ${p.side==='buy'?'tag-green':'tag-red'}" style="margin-left:6px">${p.side.toUpperCase()}</span></div>
+        <span class="trade-card-pnl ${pCls(p.unrealized_pnl)}">${p.unrealized_pnl!=null?fmtPnl(p.unrealized_pnl):'—'}</span>
+      </div>
+      <div class="trade-card-grid">
+        <div><div class="tc-label">Entry</div><div class="tc-value">$${p.entry_price?.toFixed(2)}</div></div>
+        <div><div class="tc-label">Current</div><div class="tc-value">${p.current_price?`$${p.current_price.toFixed(2)}`:'—'}</div></div>
+        <div><div class="tc-label">Stop</div><div class="tc-value red">${p.planned_stop?`$${p.planned_stop.toFixed(2)}`:'—'}</div></div>
+        <div><div class="tc-label">Target</div><div class="tc-value green">${p.planned_target?`$${p.planned_target.toFixed(2)}`:'—'}</div></div>
+      </div></div>`).join(''):
+    `<div class="table-wrap"><table><thead><tr>${['Symbol','Side','Setup','Qty','Entry','Current','Stop','Target','Unrealized'].map(h=>`<th>${h}</th>`).join('')}</tr></thead><tbody>
+    ${pos.map(p=>`<tr><td class="mono" style="font-weight:700">${esc(p.symbol)}</td><td class="${p.side==='buy'?'green':'red'}" style="font-size:12px;text-transform:uppercase">${p.side}</td><td class="muted" style="font-size:12px">${esc(p.setup_type)}</td><td class="mono">${p.quantity}</td><td class="mono">$${p.entry_price?.toFixed(2)}</td><td class="mono">${p.current_price?`$${p.current_price.toFixed(2)}`:'—'}</td><td class="mono red">${p.planned_stop?`$${p.planned_stop.toFixed(2)}`:'—'}</td><td class="mono green">${p.planned_target?`$${p.planned_target.toFixed(2)}`:'—'}</td><td class="mono ${pCls(p.unrealized_pnl)}">${p.unrealized_pnl!=null?fmtPnl(p.unrealized_pnl):'—'}</td></tr>`).join('')}
+    </tbody></table></div>`
+}
+
+/* ── Trades ── */
+function renderTrades() {
+  const trades=S.trades, totalPnl=trades.reduce((s,t)=>s+(t.pnl??0),0), wins=trades.filter(t=>t.pnl>0).length
+  $('trades-summary').innerHTML=[
+    {l:'Closed',v:trades.length},{l:'Winners',v:wins,c:'green'},{l:'Losers',v:trades.length-wins,c:'red'},{l:'Total P&L',v:fmtPnl(totalPnl),c:pCls(totalPnl)}
+  ].map(s=>`<div class="stat"><div class="stat-label">${s.l}</div><div class="stat-value ${s.c||''}">${s.v}</div></div>`).join('')
+
+  if(!trades.length){$('trades-out').innerHTML='<div class="empty">No closed trades yet</div>';return}
+  $('trades-out').innerHTML=mobile()?trades.map(t=>`
+    <div class="trade-card" style="border-left:3px solid ${t.pnl>0?'var(--green)':'var(--red)'}">
+      <div class="trade-card-header">
+        <div><span class="trade-card-sym">${esc(t.symbol)}</span> <span class="muted" style="font-size:11px;margin-left:6px">${esc(t.setup_type)}</span></div>
+        <span class="trade-card-pnl ${pCls(t.pnl)}">${fmtPnl(t.pnl)}</span>
+      </div>
+      <div class="trade-card-grid">
+        <div><div class="tc-label">Entry</div><div class="tc-value">$${t.entry_price?.toFixed(2)}</div></div>
+        <div><div class="tc-label">Exit</div><div class="tc-value">$${t.exit_price?.toFixed(2)}</div></div>
+        <div><div class="tc-label">P&L %</div><div class="tc-value ${pCls(t.pnl_pct)}">${t.pnl_pct!=null?`${t.pnl_pct>0?'+':''}${t.pnl_pct.toFixed(2)}%`:'—'}</div></div>
+        <div><div class="tc-label">Reason</div><span class="tag ${t.exit_reason==='target_hit'?'tag-green':t.exit_reason==='stop_hit'?'tag-red':'tag-muted'}">${(t.exit_reason||'—').replace('_',' ')}</span></div>
+      </div>
+      <div style="font-size:11px;color:var(--dim);margin-top:8px">${fmtD(t.exit_time)}</div>
+    </div>`).join(''):
+    `<div class="table-wrap"><table><thead><tr>${['Symbol','Setup','Side','Qty','Entry','Exit','P&L','P&L %','Reason','Date'].map(h=>`<th>${h}</th>`).join('')}</tr></thead><tbody>
+    ${trades.map(t=>`<tr><td class="mono" style="font-weight:700">${esc(t.symbol)}</td><td class="muted" style="font-size:12px">${esc(t.setup_type)}</td><td class="${t.side==='buy'?'green':'red'}" style="font-size:12px;text-transform:uppercase">${t.side}</td><td class="mono">${t.quantity}</td><td class="mono">$${t.entry_price?.toFixed(2)}</td><td class="mono">$${t.exit_price?.toFixed(2)}</td><td class="mono ${pCls(t.pnl)}" style="font-weight:700">${fmtPnl(t.pnl)}</td><td class="mono ${pCls(t.pnl_pct)}" style="font-size:12px">${t.pnl_pct!=null?`${t.pnl_pct>0?'+':''}${t.pnl_pct.toFixed(2)}%`:'—'}</td><td><span class="tag ${t.exit_reason==='target_hit'?'tag-green':t.exit_reason==='stop_hit'?'tag-red':'tag-muted'}">${(t.exit_reason||'—').replace('_',' ')}</span></td><td style="font-size:11px;color:var(--muted)">${fmtD(t.exit_time)}</td></tr>`).join('')}
+    </tbody></table></div>`
+}
+
+/* ── Performance ── */
+function renderPerf() {
+  const perf=S.performance; if(!perf) return
+  const setups=perf.by_setup||[], sum=perf.summary||{}
+  $('perf-summary').innerHTML=[
+    {l:'Total Trades',v:sum.total_trades??0},{l:'Total P&L',v:fmtPnl(sum.total_pnl),c:pCls(sum.total_pnl??0)},{l:'Setups',v:setups.length}
+  ].map(s=>`<div class="stat"><div class="stat-label">${s.l}</div><div class="stat-value ${s.c||''}">${s.v}</div></div>`).join('')
+
+  if(setups.length>0){
+    $('winrate-panel').style.display='block'
+    if(wrChart) wrChart.destroy()
+    const ctx=$('winrate-chart').getContext('2d')
+    wrChart=new Chart(ctx,{type:'bar',data:{labels:setups.map(s=>s.setup_type),datasets:[{data:setups.map(s=>s.win_rate),backgroundColor:setups.map(s=>s.win_rate>=50?'#3fb950':'#f85149'),borderRadius:4}]},
+      options:{responsive:true,maintainAspectRatio:true,plugins:{legend:{display:false},tooltip:{callbacks:{label:v=>`${v.raw}%`},displayColors:false,backgroundColor:'#0d1117',borderColor:'#21262d',borderWidth:1}},
+               scales:{x:{grid:{display:false},ticks:{color:'#7d8590',font:{size:11}}},y:{grid:{color:'#21262d22'},ticks:{color:'#7d8590',font:{size:11},callback:v=>`${v}%`},max:100}}}})
+  } else { $('winrate-panel').style.display='none' }
+
+  if(!setups.length){$('perf-out').innerHTML='<div class="empty">No strategy data yet</div>';return}
+  $('perf-out').innerHTML=mobile()?setups.map(s=>`
+    <div class="trade-card" style="margin-bottom:8px">
+      <div class="trade-card-header"><span class="mono" style="font-weight:700;font-size:14px">${esc(s.setup_type)}</span>
+        <span class="mono ${pCls(s.expectancy)}" style="font-weight:700">${fmtPnl(s.expectancy)} <span class="muted" style="font-size:10px">exp</span></span></div>
+      <div class="trade-card-grid">
+        <div><div class="tc-label">Trades</div><div class="tc-value">${s.total_trades}</div></div>
+        <div><div class="tc-label">Win Rate</div><div class="tc-value ${s.win_rate>=50?'green':'red'}">${s.win_rate}%</div></div>
+        <div><div class="tc-label">Avg Win</div><div class="tc-value green">$${s.avg_win?.toFixed(0)}</div></div>
+        <div><div class="tc-label">Avg Loss</div><div class="tc-value red">$${s.avg_loss?.toFixed(0)}</div></div>
+        <div><div class="tc-label">Prof Factor</div><div class="tc-value ${s.profit_factor>=1?'green':'red'}">${s.profit_factor?.toFixed(2)}</div></div>
+        <div><div class="tc-label">Total P&L</div><div class="tc-value ${pCls(s.total_pnl)}">${fmtPnl(s.total_pnl)}</div></div>
+      </div></div>`).join(''):
+    `<div class="table-wrap"><table><thead><tr>${['Setup','Trades','Win Rate','Avg Win','Avg Loss','Expectancy','Prof. Factor','Total P&L'].map(h=>`<th>${h}</th>`).join('')}</tr></thead><tbody>
+    ${setups.map(s=>`<tr><td class="mono" style="font-weight:700">${esc(s.setup_type)}</td><td class="mono">${s.total_trades}</td><td class="mono ${s.win_rate>=50?'green':'red'}" style="font-weight:700">${s.win_rate}%</td><td class="mono green">$${s.avg_win?.toFixed(2)}</td><td class="mono red">$${s.avg_loss?.toFixed(2)}</td><td class="mono ${pCls(s.expectancy)}" style="font-weight:700">$${s.expectancy?.toFixed(2)}</td><td class="mono ${s.profit_factor>=1?'green':'red'}">${s.profit_factor?.toFixed(2)}</td><td class="mono ${pCls(s.total_pnl)}" style="font-weight:700">${fmtPnl(s.total_pnl)}</td></tr>`).join('')}
+    </tbody></table></div>`
+}
+
+/* ── Decisions ── */
+const AC={research:'var(--blue)',strategy:'var(--purple)',monitor:'var(--amber)',journal:'var(--green)'}
+function renderDecisions(){
+  const dec=S.decisions, agents=['all',...new Set(dec.map(d=>d.agent))]
+  $('decision-filters').innerHTML=agents.map(a=>`<button class="filter-tab ${dFilter===a?'active':''}" onclick="setDF('${a}')">${a}</button>`).join('')
+  const f=dFilter==='all'?dec:dec.filter(d=>d.agent===dFilter)
+  $('decisions-out').innerHTML=!f.length?'<div class="empty">No decisions logged yet</div>':f.map(d=>`
+    <div class="decision-card" style="border-left-color:${AC[d.agent]||'var(--border-bright)'}">
+      <div class="decision-header">
+        <span class="agent-label" style="color:${AC[d.agent]||'var(--text)'}">${esc(d.agent)}</span>
+        <span class="decision-type">${(d.decision_type||'').replace('_',' ')}</span>
+        ${d.symbol?`<span class="mono" style="font-weight:700">${esc(d.symbol)}</span>`:''}
+        <span class="decision-time">${fmtT(d.created_at)}</span>
+      </div>
+      ${d.reasoning?`<p class="decision-body">${esc(d.reasoning)}</p>`:''}
+      ${d.output?`<details><summary>Raw output ↓</summary><pre>${esc(JSON.stringify(d.output,null,2))}</pre></details>`:''}
+    </div>`).join('')
+}
+function setDF(f){dFilter=f;renderDecisions()}
+
+/* ── Journal ── */
+function scC(n){return n>=8?'var(--green)':n>=6?'var(--amber)':'var(--red)'}
+function renderJournal(){
+  const j=S.journal
+  $('journal-out').innerHTML=!j.length?'<div class="empty">Journal entries appear after the first EOD close</div>':j.map(j=>`
+    <div class="journal-card">
+      <div class="journal-header">
+        <span class="journal-sym">${esc(j.symbol)}</span>
+        <span class="journal-pnl ${pCls(j.pnl)}">${fmtPnl(j.pnl)} <span style="font-size:11px;opacity:.7">(${j.pnl_pct>0?'+':''}${j.pnl_pct?.toFixed(2)}%)</span></span>
+        <span class="journal-date">${fmtD(j.created_at)}</span>
+      </div>
+      <div class="scores">
+        ${[{s:j.entry_quality_score,l:'Entry'},{s:j.exit_quality_score,l:'Exit'},{s:j.plan_adherence_score,l:'Plan'}].map(({s,l})=>
+          `<div class="score-item"><div class="score-dot" style="color:${scC(s)};border-color:${scC(s)};background:${scC(s)}22">${s}</div><span class="score-lbl">${l}</span></div>`).join('')}
+      </div>
+      ${[{label:'What happened',value:j.what_happened},{label:'What went right',value:j.what_went_right},{label:'What went wrong',value:j.what_went_wrong},{label:'Lessons',value:j.lessons}]
+        .filter(s=>s.value&&s.value!=='N/A').map(s=>`<div class="j-section"><div class="j-section-label">${s.label}</div><div class="j-section-body">${esc(s.value)}</div></div>`).join('')}
+    </div>`).join('')
+}
+
+fetchAll()
+setInterval(fetchAll,30000)
+window.addEventListener('resize',render)
+</script>
+</body>
+</html>

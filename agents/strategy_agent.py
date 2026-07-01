@@ -1,9 +1,18 @@
 """
-Strategy Agent
-Receives the research briefing and decides specific trade entries.
-- Retrieves similar historical trades from memory (pgvector)
-- Calls Claude to produce concrete trade plans
-- Applies risk rules before passing to execution
+Strategy Agent v2 — division of labor.
+
+Old design: the LLM output quantity, entry price, stop, target, dollar_risk,
+and risk_reward. LLMs are unreliable at arithmetic, and their entry prices
+were based on the 9:45 AM research snapshot — stale by execution time.
+
+New design:
+  LLM decides (judgment):   which setups to take, direction, conviction, why
+  Code decides (arithmetic): entry from LIVE quote, stop/target from ATR,
+                             quantity from the 2% risk rule, all caps
+  Pydantic validates:        the LLM's JSON never flows raw into an order
+
+Trades are recorded as PENDING_FILL — they only become OPEN positions when
+the order tracker confirms a broker fill (phantom-trade fix).
 """
 import os
 import json
@@ -14,84 +23,49 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-STRATEGY_SYSTEM_PROMPT = """You are a disciplined quantitative trader executing a paper trading strategy.
-You receive a market research briefing and must decide specific trade entries.
+STRATEGY_SYSTEM_PROMPT = """You are a disciplined quantitative trader evaluating intraday setups.
+You receive a market research briefing plus your own historical performance data.
 
-Rules you MUST follow:
-- Only trade setups with confidence >= 0.60
-- Never risk more than 2% of portfolio per trade (position size = (portfolio * 0.02) / stop_distance)
-- Always specify a stop loss (mandatory) and a profit target (minimum 1.5:1 R/R)
-- Stop loss: 0.4x to 0.7x ATR from entry. ATR is the DAILY range — half of that is your intraday stop.
-- Profit target: 0.8x to 1.5x ATR from entry. This represents 80-150% of the typical daily move — achievable intraday.
-- These are INTRADAY positions that close at 4:15 PM ET — size targets for realistic same-day moves.
-- A stock moving 1x ATR intraday is normal. 4x ATR in one day is extremely rare. Be realistic.
-- Prefer limit orders over market orders
-- For momentum setups: enter near VWAP or on pullbacks, not extended moves
-- For options: target 2+ months to expiration, avoid weeklies
+Your ONLY job is to decide WHICH setups (if any) are worth taking and WHY.
+Do NOT calculate position sizes, prices, stops, or targets — the execution
+engine computes all numbers from live quotes. Focus entirely on judgment:
+- Is this setup high quality right now?
+- Does the historical performance of this setup type support taking it?
+- Is the thesis specific and falsifiable, or vague hope?
+
+Be selective. Skipping is a valid decision — most days do not offer 3 good
+trades. A pick with conviction below 0.60 will be discarded, so do not pad.
 
 Respond ONLY with valid JSON. No preamble, no markdown fences.
 Structure:
 {
-  "trades": [
+  "picks": [
     {
       "symbol": "NVDA",
-      "asset_type": "stock",
-      "side": "buy",
+      "direction": "long",
       "setup_type": "momentum",
-      "quantity": 50,
-      "entry_price": 121.00,
-      "entry_type": "limit",
-      "stop_loss": 119.75,
-      "take_profit": 122.50,
-      "risk_reward": 2.14,
-      "dollar_risk": 175.00,
-      "reasoning": "<2-3 sentences>",
-      "entry_conditions": "<what needs to happen before entry is valid>"
+      "conviction": 0.72,
+      "reasoning": "<2-3 sentences: why this setup is worth risk right now>",
+      "entry_conditions": "<what would invalidate this before entry>"
     }
   ],
-  "skip_reason": "<if no trades, why>",
-  "portfolio_risk_used": 0.035
+  "skip_reason": "<if no picks, why — otherwise null>"
 }
-CRITICAL: ATR is the full daily range. stop_loss = entry - 0.5*ATR, take_profit = entry + 1.0*ATR. Example for $120 stock with ATR=$2.50: stop=$118.75, target=$122.50. NEVER set targets 5%+ away on intraday trades.
-Return at most 3 trades. Return empty trades array if conditions aren't right.
+Return at most 3 picks. Only pick symbols that appear in the briefing's
+opportunities and are not on the avoid list.
 """
 
 
-def _retrieve_similar_trades(db, embedding_text: str, limit: int = 5) -> list[dict]:
-    """
-    Retrieve similar historical trades using pgvector cosine similarity.
-    Falls back to recent trades if pgvector embedding not yet populated.
-    """
-    if db is None:
-        return []
-    try:
-        from db.operations import get_trade_history
-        trades = get_trade_history(db, limit=limit)
-        return [
-            {
-                "symbol":     t.symbol,
-                "setup_type": t.setup_type.value if hasattr(t.setup_type, 'value') else str(t.setup_type),
-                "pnl":        t.pnl,
-                "pnl_pct":    t.pnl_pct,
-                "exit_reason": t.exit_reason,
-                "entry_context": t.entry_context,
-            }
-            for t in trades
-        ]
-    except Exception:
-        return []
-
-
-def _build_strategy_prompt(briefing: dict, account: dict, similar_trades: list[dict], stats_summary: str = "") -> str:
+def _build_strategy_prompt(briefing: dict, account: dict,
+                           similar_trades: list[dict], stats_summary: str = "") -> str:
     parts = []
 
-    parts.append(f"PORTFOLIO STATUS:")
+    parts.append("PORTFOLIO STATUS:")
     parts.append(f"  Cash: ${account.get('cash', 0):,.2f}")
     parts.append(f"  Equity: ${account.get('equity', 0):,.2f}")
-    parts.append(f"  Buying power: ${account.get('buying_power', 0):,.2f}")
     parts.append("")
 
-    parts.append(f"MARKET BRIEFING:")
+    parts.append("MARKET BRIEFING:")
     parts.append(f"  Market mood: {briefing.get('market_mood')} — {briefing.get('market_mood_reason', '')}")
     parts.append(f"  Symbols to avoid: {briefing.get('avoid', [])}")
     parts.append(f"  Avoid reason: {briefing.get('avoid_reason', '')}")
@@ -101,7 +75,7 @@ def _build_strategy_prompt(briefing: dict, account: dict, similar_trades: list[d
     for opp in briefing.get("opportunities", []):
         parts.append(
             f"  {opp['symbol']}: {opp['direction'].upper()} | "
-            f"setup={opp['setup_type']} | confidence={opp['confidence']:.2f} | "
+            f"setup={opp['setup_type']} | research_confidence={opp['confidence']:.2f} | "
             f"key_level={opp.get('key_level', 'N/A')}"
         )
         parts.append(f"    Thesis: {opp['thesis']}")
@@ -109,13 +83,13 @@ def _build_strategy_prompt(briefing: dict, account: dict, similar_trades: list[d
     parts.append("")
 
     if similar_trades:
-        parts.append("SIMILAR HISTORICAL TRADES (memory):")
-        for t in similar_trades[:3]:
-            outcome = f"+${t['pnl']:.2f}" if t.get('pnl') and t['pnl'] > 0 else f"-${abs(t.get('pnl', 0)):.2f}"
+        parts.append("RELEVANT HISTORICAL TRADES (same symbol or setup):")
+        for t in similar_trades[:5]:
+            pnl = t.get("pnl") or 0
             parts.append(
-                f"  {t['symbol']} {t['setup_type']} → {outcome} ({t.get('exit_reason', 'N/A')})"
+                f"  {t['symbol']} {t['setup_type']} → {pnl:+.2f} ({t.get('exit_reason', 'N/A')})"
             )
-            if t.get('lessons'):
+            if t.get("lessons"):
                 parts.append(f"    Lesson: {t['lessons']}")
         parts.append("")
 
@@ -123,7 +97,7 @@ def _build_strategy_prompt(briefing: dict, account: dict, similar_trades: list[d
         parts.append(stats_summary)
         parts.append("")
 
-    parts.append("Decide which trades to enter. Apply the rules strictly.")
+    parts.append("Decide which setups (if any) deserve risk today. Be selective.")
     return "\n".join(parts)
 
 
@@ -144,191 +118,236 @@ class StrategyAgent:
         from agents.llm_client import call_llm
         return call_llm(STRATEGY_SYSTEM_PROMPT, prompt)
 
+    # ─── Main pipeline ─────────────────────────────────────────────────────────
+
     def run(self, briefing: dict) -> dict:
         """
-        Evaluate a research briefing and produce trade plans.
-        Places orders via broker client.
-        Returns the strategy decision dict.
+        1. LLM picks setups (judgment only)
+        2. Pydantic + business rules validate the picks
+        3. Code sizes each trade from live quote + ATR
+        4. Orders placed, trades recorded as PENDING_FILL
         """
-        # 1. Get account state
+        from execution.sizing import (
+            validate_llm_decision, build_trade_plan, MAX_SESSION_RISK_PCT
+        )
+        from data.live_price import get_live_prices
+
         account = self.broker.get_account()
+        equity  = account.get("equity", account.get("cash", 100_000))
 
-        # 2. Retrieve memory + strategy stats from pgvector
-        similar = []
-        stats_summary = ""
-        if self.db:
-            try:
-                from agents.memory import find_similar_trades, get_strategy_performance_summary
-                for opp in briefing.get("opportunities", [])[:2]:
-                    similar += find_similar_trades(
-                        self.db,
-                        symbol=opp["symbol"],
-                        setup_type=opp.get("setup_type", "momentum"),
-                        direction=opp.get("direction", "long"),
-                        limit=3,
-                    )
-                stats_summary = get_strategy_performance_summary(self.db)
-            except Exception as e:
-                print(f"  [strategy] memory lookup failed: {e}")
+        # Memory + stats context for the LLM
+        similar, stats_summary = self._gather_context(briefing)
 
-        # 3. Build prompt and call LLM
+        # 1-2. LLM call + validation
         prompt = _build_strategy_prompt(briefing, account, similar, stats_summary)
-        decision = self._call_llm(prompt)
-        decision["decided_at"] = datetime.utcnow().isoformat()
+        raw = self._call_llm(prompt)
+        try:
+            decision = validate_llm_decision(raw, briefing)
+        except Exception as e:
+            print(f"  [strategy] LLM output failed validation: {e}")
+            return {"trades": [], "executed": [],
+                    "skip_reason": f"invalid LLM output: {e}",
+                    "decided_at": datetime.utcnow().isoformat()}
 
-        # 4. Execute approved trades
+        if not decision.picks:
+            result = {"trades": [], "executed": [],
+                      "skip_reason": decision.skip_reason or "no picks survived validation",
+                      "decided_at": datetime.utcnow().isoformat()}
+            self._log(briefing, result)
+            return result
+
+        # 3. Deterministic sizing from LIVE quotes
+        symbols = [p.symbol for p in decision.picks]
+        prices  = get_live_prices(symbols, data_provider=self.data)
+        atrs    = self._get_atrs(symbols)
+
+        risk_budget = equity * MAX_SESSION_RISK_PCT
+        plans = []
+        for pick in decision.picks:
+            plan = build_trade_plan(
+                pick,
+                live_price=prices.get(pick.symbol),
+                atr=atrs.get(pick.symbol),
+                equity=equity,
+                risk_budget_left=risk_budget,
+            )
+            if plan:
+                plans.append(plan)
+                risk_budget -= plan.dollar_risk
+
+        # 4. Execute
         executed = []
-        for trade_plan in decision.get("trades", []):
+        for plan in plans:
             try:
-                result = self._execute_trade(trade_plan, account)
+                result = self._execute_plan(plan, account)
                 if result:
                     executed.append(result)
             except Exception as e:
-                print(f"  [strategy] execution error for {trade_plan.get('symbol')}: {e}")
+                print(f"  [strategy] execution error for {plan.symbol}: {e}")
 
-        decision["executed"] = executed
+        result = {
+            "trades":   [p.model_dump() for p in plans],
+            "executed": executed,
+            "skip_reason": None if plans else "no plans survived sizing",
+            "portfolio_risk_used": round(sum(p.dollar_risk for p in plans) / equity, 4),
+            "decided_at": datetime.utcnow().isoformat(),
+        }
+        self._log(briefing, result)
+        return result
 
-        # 5. Log decision
+    # ─── Helpers ───────────────────────────────────────────────────────────────
+
+    def _gather_context(self, briefing: dict) -> tuple[list[dict], str]:
+        similar, stats_summary = [], ""
         if self.db:
-            from db.operations import log_decision
-            log_decision(
-                self.db, agent="strategy", decision_type="evaluate",
-                reasoning=decision.get("skip_reason") or f"Evaluated {len(decision.get('trades',[]))} setups",
-                inputs={"briefing_mood": briefing.get("market_mood")},
-                output=decision,
-            )
+            try:
+                from agents.memory import find_similar_trades, get_strategy_performance_summary
+                seen_ids = set()
+                for opp in briefing.get("opportunities", [])[:3]:
+                    for t in find_similar_trades(
+                        self.db, symbol=opp["symbol"],
+                        setup_type=opp.get("setup_type", "momentum"),
+                        direction=opp.get("direction", "long"), limit=3,
+                    ):
+                        key = (t.get("symbol"), t.get("pnl"), t.get("exit_reason"))
+                        if key not in seen_ids:
+                            seen_ids.add(key)
+                            similar.append(t)
+                stats_summary = get_strategy_performance_summary(self.db)
+            except Exception as e:
+                print(f"  [strategy] memory lookup failed: {e}")
+        return similar, stats_summary
 
-        return decision
+    def _get_atrs(self, symbols: list[str]) -> dict[str, float]:
+        atrs = {}
+        for sym in symbols:
+            try:
+                bar = self.data.fetch_latest_bar(sym)
+                if bar and bar.get("atr_14"):
+                    atrs[sym] = float(bar["atr_14"])
+            except Exception as e:
+                print(f"  [strategy] ATR fetch failed for {sym}: {e}")
+        return atrs
 
-    def _execute_trade(self, plan: dict, account: dict) -> Optional[dict]:
-        """Place a single order and record it in DB."""
-        symbol = plan["symbol"]
-        side = plan["side"]
-        qty = plan["quantity"]
-        entry_price = plan["entry_price"]
-        stop = plan.get("stop_loss")
-        target = plan.get("take_profit")
+    def _execute_plan(self, plan, account: dict) -> Optional[dict]:
+        """Place the order and record the trade as PENDING_FILL."""
+        account = self.broker.get_account()  # refresh after prior fills
 
-        # Refresh account to get latest buying power after prior fills
-        account = self.broker.get_account()
-
-        # Cap position value at 15% of equity (prevents over-concentration)
-        equity = account.get("equity", account.get("cash", 100_000))
-        max_position_value = equity * 0.15
-        max_qty_by_value = int(max_position_value / entry_price)
-        qty = min(qty, max_qty_by_value)
-        if qty <= 0:
-            print(f"  [strategy] skipping {symbol} — position size zero after cap")
+        cost = plan.quantity * plan.entry_price
+        if plan.side == "buy" and cost > account.get("buying_power", 0) * 0.95:
+            print(f"  [strategy] skipping {plan.symbol} — insufficient buying power "
+                  f"(${cost:.0f} vs ${account.get('buying_power', 0):.0f})")
             return None
 
-        cost = qty * entry_price
-        if cost > account.get("buying_power", 0) * 0.95:
-            print(f"  [strategy] skipping {symbol} — insufficient buying power (${cost:.0f} vs ${account.get('buying_power',0):.0f})")
-            return None
-
-        # Place order
         order = self.broker.place_limit_order(
-            symbol=symbol, qty=qty, side=side,
-            limit_price=entry_price, stop_loss=stop, take_profit=target,
+            symbol=plan.symbol, qty=plan.quantity, side=plan.side,
+            limit_price=plan.entry_price,
+            stop_loss=plan.stop_loss, take_profit=plan.take_profit,
         )
 
-        # Persist to DB — Alpaca returns "accepted" not "filled" for limit orders
-        if self.db and order.get("status") in ("filled", "accepted", "pending_new", "new"):
+        if order.get("status") == "failed" or not order.get("id"):
+            print(f"  [strategy] order rejected for {plan.symbol}")
+            return None
+
+        if self.db:
             from db.operations import open_trade, log_decision
-            from db.models import AssetType, OrderSide
+            from db.models import AssetType, OrderSide, TradeStatus
+
+            # Mock broker fills instantly → OPEN; Alpaca → PENDING_FILL until
+            # the order tracker confirms the fill.
+            instant_fill = (order.get("status") == "filled"
+                            and order.get("fill_price") is not None)
+
             trade = open_trade(self.db, {
-                "symbol":        symbol,
-                "asset_type":    AssetType(plan.get("asset_type", "stock")),
-                "setup_type":    plan.get("setup_type", "custom"),
-                "side":          OrderSide(side),
-                "entry_price":   order.get("fill_price", entry_price),
-                "quantity":      qty,
-                "planned_stop":  stop,
-                "planned_target": target,
+                "symbol":        plan.symbol,
+                "asset_type":    AssetType(plan.asset_type),
+                "setup_type":    plan.setup_type,
+                "side":          OrderSide(plan.side),
+                "entry_price":   order.get("fill_price") or plan.entry_price,
+                "quantity":      plan.quantity,
+                "planned_stop":  plan.stop_loss,
+                "planned_target": plan.take_profit,
+                "status":        TradeStatus.OPEN if instant_fill else TradeStatus.PENDING_FILL,
                 "entry_context": {
-                    "reasoning":          plan.get("reasoning"),
-                    "entry_conditions":   plan.get("entry_conditions"),
-                    "risk_reward":        plan.get("risk_reward"),
-                    "dollar_risk":        plan.get("dollar_risk"),
-                    "alpaca_order_id":    order.get("id"),
+                    "reasoning":        plan.reasoning,
+                    "entry_conditions": plan.entry_conditions,
+                    "risk_reward":      plan.risk_reward,
+                    "dollar_risk":      plan.dollar_risk,
+                    "alpaca_order_id":  order.get("id"),
+                    "sized_by":         "deterministic_engine_v2",
                 },
                 "alpaca_order_id": order.get("id"),
             })
             log_decision(
                 self.db, agent="strategy", decision_type="enter",
-                symbol=symbol, trade_id=trade.id,
-                reasoning=plan.get("reasoning"),
-                inputs=plan, output=order,
+                symbol=plan.symbol, trade_id=trade.id,
+                reasoning=plan.reasoning,
+                inputs=plan.model_dump(), output=order,
             )
             order["trade_db_id"] = str(trade.id)
+            order["trade_status"] = "open" if instant_fill else "pending_fill"
 
         return order
 
-    def run_mock(self, briefing: dict) -> dict:
-        """
-        Return a mock strategy decision (no Claude API needed).
-        Always uses MockDataProvider for bar data — safe fallback path.
-        """
-        account = self.broker.get_account()
-        equity = account.get("equity", 100_000)
+    def _log(self, briefing: dict, result: dict):
+        if not self.db:
+            return
+        from db.operations import log_decision
+        log_decision(
+            self.db, agent="strategy", decision_type="evaluate",
+            reasoning=result.get("skip_reason") or
+                      f"Planned {len(result.get('trades', []))} trades",
+            inputs={"briefing_mood": briefing.get("market_mood")},
+            output=result,
+        )
 
-        # Always use mock data for bar lookups in mock mode
+    # ─── Mock path (no LLM needed) ────────────────────────────────────────────
+
+    def run_mock(self, briefing: dict) -> dict:
+        """Mock decision path — uses the same deterministic sizing engine."""
+        from execution.sizing import LLMPick, build_trade_plan, MAX_SESSION_RISK_PCT
         from data.market_data import MockDataProvider
+
+        account = self.broker.get_account()
+        equity  = account.get("equity", 100_000)
         mock_dp = MockDataProvider()
 
-        # Build a plausible trade from the first opportunity
-        opps = briefing.get("opportunities", [])
-        trades = []
-        for opp in opps[:2]:
-            sym = opp["symbol"]
-            bar = mock_dp.fetch_latest_bar(sym)
+        risk_budget = equity * MAX_SESSION_RISK_PCT
+        plans = []
+        for opp in briefing.get("opportunities", [])[:2]:
+            bar = mock_dp.fetch_latest_bar(opp["symbol"])
             if not bar:
                 continue
-            close = bar["close"]
-            atr = bar.get("atr_14", close * 0.01)
-            # Intraday realistic: stop=0.5x ATR, target=1.0x ATR (2:1 R/R)
-            # ATR = typical daily move, so 0.5x/1.0x = realistic intraday levels
-            stop = round(close - 0.5 * atr, 2)
-            target = round(close + 1.0 * atr, 2)
-            stop_dist = close - stop
-            qty = max(1, int((equity * 0.02) / stop_dist)) if stop_dist > 0 else 10
-            trades.append({
-                "symbol":      sym,
-                "asset_type":  "stock",
-                "side":        "buy" if opp["direction"] == "long" else "sell",
-                "setup_type":  opp["setup_type"],
-                "quantity":    qty,
-                "entry_price": round(close, 2),
-                "entry_type":  "limit",
-                "stop_loss":   stop,
-                "take_profit": target,
-                "risk_reward": round((target - close) / stop_dist, 2) if stop_dist > 0 else 2.0,
-                "dollar_risk": round(qty * stop_dist, 2),
-                "reasoning":   opp["thesis"],
-                "entry_conditions": f"Enter on a pullback to VWAP or on break of ${close:.2f}",
-            })
+            pick = LLMPick(
+                symbol=opp["symbol"],
+                direction=opp.get("direction", "long"),
+                setup_type=opp.get("setup_type", "momentum"),
+                conviction=opp.get("confidence", 0.7),
+                reasoning=opp.get("thesis", "mock setup evaluation"),
+                entry_conditions="mock",
+            )
+            plan = build_trade_plan(
+                pick, live_price=bar["close"],
+                atr=bar.get("atr_14", bar["close"] * 0.01),
+                equity=equity, risk_budget_left=risk_budget,
+            )
+            if plan:
+                plans.append(plan)
+                risk_budget -= plan.dollar_risk
+
+        executed = []
+        for plan in plans:
+            result = self._execute_plan(plan, account)
+            if result:
+                executed.append(result)
 
         mock_decision = {
-            "trades": trades,
-            "skip_reason": None if trades else "No high-confidence setups found",
-            "portfolio_risk_used": round(sum(t["dollar_risk"] for t in trades) / equity, 4),
+            "trades":   [p.model_dump() for p in plans],
+            "executed": executed,
+            "skip_reason": None if plans else "No high-confidence setups found",
+            "portfolio_risk_used": round(sum(p.dollar_risk for p in plans) / equity, 4),
             "decided_at": datetime.utcnow().isoformat(),
             "_mock": True,
         }
-
-        # Actually execute via mock broker
-        executed = []
-        for plan in trades:
-            result = self._execute_trade(plan, account)
-            if result:
-                executed.append(result)
-        mock_decision["executed"] = executed
-
-        if self.db:
-            from db.operations import log_decision
-            log_decision(self.db, agent="strategy", decision_type="evaluate",
-                         reasoning=f"Mock: {len(trades)} trades planned",
-                         inputs={"mood": briefing.get("market_mood")},
-                         output=mock_decision)
-
+        self._log(briefing, mock_decision)
         return mock_decision

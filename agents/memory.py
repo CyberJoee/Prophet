@@ -1,8 +1,19 @@
 """
-Memory System
-Semantic search over past trade journals using pgvector.
-The strategy agent calls this before entering any new trade
-to retrieve similar historical setups and their outcomes.
+Memory System v2.
+
+The old version called Groq's embeddings endpoint with text-embedding-ada-002
+— an OpenAI model that Groq does not serve. The call failed on every single
+invocation, so the pgvector path never executed and the fallback silently
+returned the N most recent trades of ANY kind, mislabeled as "similar trades."
+
+This version retrieves what the strategy agent actually needs:
+  1. Trades on the SAME SYMBOL (most relevant)
+  2. Trades with the SAME SETUP TYPE (next most relevant)
+Both with journal lessons attached, most recent first.
+
+If you later want true semantic search, wire a real embedding provider
+(e.g. sentence-transformers locally, or Voyage/OpenAI API) into
+embed_journal_entry() below — the pgvector column and index already exist.
 """
 import os
 from dotenv import load_dotenv
@@ -10,67 +21,56 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-def _embed_query(text: str) -> list[float]:
-    """Embed a query string using Groq."""
-    try:
-        from groq import Groq
-        client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-        response = client.embeddings.create(
-            model="text-embedding-ada-002",
-            input=text[:2000],
-        )
-        return response.data[0].embedding
-    except Exception as e:
-        print(f"  [memory] embed failed: {e}")
-        return None
-
-
 def find_similar_trades(db, symbol: str, setup_type: str,
                         direction: str = "long", limit: int = 5) -> list[dict]:
     """
-    Find the most similar past trades using pgvector cosine similarity.
-    Falls back to recent trades filtered by setup type if embedding fails.
-
-    Returns list of dicts with trade details and journal analysis.
+    Retrieve the most relevant historical trades for a prospective setup:
+    same-symbol trades first, then same-setup trades, most recent first.
     """
-    from db.models import TradeJournal, Trade, TradeStatus
-    from sqlalchemy import text
+    from db.models import TradeJournal, Trade, TradeStatus, SetupType
 
-    query_text = f"{symbol} {setup_type} {direction} trade setup entry exit lessons"
+    results = []
+    seen_trade_ids = set()
 
-    # Try vector similarity search first
-    embedding = _embed_query(query_text)
-    if embedding is not None:
-        try:
-            # pgvector cosine similarity — lower distance = more similar
-            results = (
-                db.query(TradeJournal, Trade)
-                .join(Trade, TradeJournal.trade_id == Trade.id)
-                .filter(
-                    Trade.status == TradeStatus.CLOSED,
-                    TradeJournal.embedding.isnot(None),
-                )
-                .order_by(
-                    TradeJournal.embedding.cosine_distance(embedding)
-                )
-                .limit(limit)
-                .all()
-            )
-            if results:
-                return [_format_result(j, t) for j, t in results]
-        except Exception as e:
-            print(f"  [memory] vector search failed ({e}) — falling back to recent")
-
-    # Fallback: recent trades filtered by setup type
-    results = (
+    # 1. Same symbol (any setup) — the strongest relevance signal
+    same_symbol = (
         db.query(TradeJournal, Trade)
         .join(Trade, TradeJournal.trade_id == Trade.id)
-        .filter(Trade.status == TradeStatus.CLOSED)
+        .filter(
+            Trade.status == TradeStatus.CLOSED,
+            Trade.symbol == symbol.upper(),
+        )
         .order_by(Trade.exit_time.desc())
         .limit(limit)
         .all()
     )
-    return [_format_result(j, t) for j, t in results]
+    for j, t in same_symbol:
+        seen_trade_ids.add(t.id)
+        results.append(_format_result(j, t))
+
+    # 2. Same setup type (any symbol) — fill remaining slots
+    if len(results) < limit:
+        try:
+            setup_enum = SetupType(setup_type)
+        except ValueError:
+            setup_enum = None
+        if setup_enum is not None:
+            same_setup = (
+                db.query(TradeJournal, Trade)
+                .join(Trade, TradeJournal.trade_id == Trade.id)
+                .filter(
+                    Trade.status == TradeStatus.CLOSED,
+                    Trade.setup_type == setup_enum,
+                    Trade.id.notin_(seen_trade_ids) if seen_trade_ids else True,
+                )
+                .order_by(Trade.exit_time.desc())
+                .limit(limit - len(results))
+                .all()
+            )
+            for j, t in same_setup:
+                results.append(_format_result(j, t))
+
+    return results
 
 
 def _format_result(journal, trade) -> dict:

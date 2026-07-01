@@ -99,11 +99,15 @@ def morning_pipeline():
             except Exception:
                 pass
 
-        # Sync Alpaca positions into DB after placing orders
+        # Sync Alpaca positions into DB after placing orders, then run an
+        # immediate fill-confirmation pass so instant fills go OPEN right away
         try:
             import time; time.sleep(3)
             from execution.alpaca_sync import sync_alpaca_to_db
             sync_alpaca_to_db(db)
+            from execution.order_tracker import confirm_fills
+            fills = confirm_fills(db, broker)
+            print(f"  [tracker] post-pipeline: {fills}")
         except Exception as e:
             print(f"  [sync] Post-pipeline sync failed: {e}")
 

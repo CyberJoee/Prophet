@@ -115,20 +115,20 @@ class JournalAgent:
 
     def _embed(self, text: str) -> list[float]:
         """
-        Generate a 1536-dim embedding using Groq's embedding model.
-        Falls back to a zero vector if embedding fails.
+        Embedding hook — currently returns None (stored as NULL).
+
+        The previous version called Groq with 'text-embedding-ada-002', an
+        OpenAI model that Groq does not serve; it failed on every call and
+        stored ZERO VECTORS, which are worse than NULL — in cosine-distance
+        terms every zero vector is identical, so any similarity search over
+        them returns meaningless matches.
+
+        Memory retrieval now uses symbol/setup filtering (agents/memory.py),
+        which needs no embeddings. To enable true semantic search later,
+        plug a real provider in here (sentence-transformers locally, or an
+        OpenAI/Voyage API key) and backfill the existing rows.
         """
-        try:
-            client = self._get_groq()
-            # Groq supports OpenAI-compatible embeddings
-            response = client.embeddings.create(
-                model="text-embedding-ada-002",
-                input=text[:2000],  # truncate to avoid token limits
-            )
-            return response.data[0].embedding
-        except Exception as e:
-            print(f"  [journal] embedding failed ({e}) — using zero vector")
-            return [0.0] * 1536
+        return None
 
     def _get_similar_trades(self, trade) -> list[dict]:
         """Get recent closed trades for context. pgvector similarity used once we have embeddings."""

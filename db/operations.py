@@ -113,12 +113,63 @@ def open_trade(db: Session, trade_data: dict) -> Trade:
         iv_at_entry=trade_data.get("iv_at_entry"),
         delta_at_entry=trade_data.get("delta_at_entry"),
         alpaca_order_id=trade_data.get("alpaca_order_id"),
-        status=TradeStatus.OPEN,
+        # NEW: default to PENDING_FILL — a trade only becomes OPEN once the
+        # broker confirms a fill (see execution/order_tracker.py).
+        status=trade_data.get("status", TradeStatus.PENDING_FILL),
     )
     db.add(trade)
     db.commit()
     db.refresh(trade)
     return trade
+
+
+def confirm_trade_fill(db: Session, trade_id, fill_price: float,
+                       fill_time: datetime = None, filled_qty: float = None) -> Trade:
+    """Promote a PENDING_FILL trade to OPEN with the broker's actual fill data."""
+    trade = db.query(Trade).filter(Trade.id == trade_id).first()
+    if not trade:
+        raise ValueError(f"Trade {trade_id} not found")
+    trade.status = TradeStatus.OPEN
+    trade.entry_price = fill_price
+    trade.entry_time = fill_time or datetime.utcnow()
+    if filled_qty is not None and filled_qty > 0:
+        trade.quantity = filled_qty
+    db.commit()
+    db.refresh(trade)
+    return trade
+
+
+def cancel_pending_trade(db: Session, trade_id, reason: str = "order_not_filled") -> Trade:
+    """Mark a PENDING_FILL trade as CANCELLED — the order never became a position."""
+    trade = db.query(Trade).filter(Trade.id == trade_id).first()
+    if not trade:
+        raise ValueError(f"Trade {trade_id} not found")
+    trade.status = TradeStatus.CANCELLED
+    trade.exit_reason = reason
+    trade.exit_time = datetime.utcnow()
+    db.commit()
+    db.refresh(trade)
+    return trade
+
+
+def get_pending_trades(db: Session) -> list[Trade]:
+    return db.query(Trade).filter(Trade.status == TradeStatus.PENDING_FILL).all()
+
+
+def update_trade_excursions(db: Session, trade_id, current_pnl: float) -> None:
+    """
+    Track true max adverse/favorable excursion while a trade is open.
+    Called by the position monitor on every check.
+    """
+    trade = db.query(Trade).filter(Trade.id == trade_id).first()
+    if not trade:
+        return
+    mae = trade.max_adverse_excursion or 0.0
+    mfe = trade.max_favorable_excursion or 0.0
+    trade.max_adverse_excursion = min(mae, current_pnl)
+    trade.max_favorable_excursion = max(mfe, current_pnl)
+    db.commit()
+
 
 def close_trade(db: Session, trade_id, exit_price: float,
                 exit_reason: str = "manual",
@@ -130,8 +181,12 @@ def close_trade(db: Session, trade_id, exit_price: float,
     trade.exit_time = datetime.utcnow()
     trade.exit_reason = exit_reason
     trade.status = TradeStatus.CLOSED
-    trade.max_adverse_excursion = max_adverse
-    trade.max_favorable_excursion = max_favorable
+    # Only overwrite excursions if explicitly provided — the monitor now
+    # tracks true running MAE/MFE while the trade is open.
+    if max_adverse is not None:
+        trade.max_adverse_excursion = max_adverse
+    if max_favorable is not None:
+        trade.max_favorable_excursion = max_favorable
     # P&L calculation
     multiplier = 1 if trade.side.value == "buy" else -1
     trade.pnl = (exit_price - trade.entry_price) * trade.quantity * multiplier

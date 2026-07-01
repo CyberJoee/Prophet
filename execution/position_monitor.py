@@ -1,10 +1,24 @@
 """
-Position Monitor
+Position Monitor v2 — reconciliation model.
+
+The old design had TWO owners of exits: Alpaca's server-side bracket legs
+AND this monitor calling close_position() on 5-minute polls. That caused
+"insufficient qty available" errors (shares held by bracket legs), DB drift
+when a leg fired between polls, and gap-through-stop risk.
+
+New design — exactly one owner of exits per mode:
+  Alpaca (supports_bracket_orders=True):
+      Bracket legs ARE the exit. The monitor only RECONCILES:
+        1. confirm pending fills (order_tracker)
+        2. detect fired bracket legs → close trade in DB at the leg's
+           actual fill price
+        3. detect vanished positions → reconcile-close at live price
+        4. track true running MAE/MFE on open trades
+  Mock (supports_bracket_orders=False):
+      No server-side legs exist, so the monitor keeps making price-based
+      exit decisions like before (test path only).
+
 Runs every 5 minutes during market hours.
-- Checks all open trades against current prices
-- Closes positions that hit stop loss or take profit
-- Logs all actions to agent_decisions table
-- Saves portfolio snapshot every 30 minutes
 """
 import os
 from datetime import datetime
@@ -28,227 +42,259 @@ class PositionMonitor:
         self.db      = db_session
         self._snapshot_counter = 0
 
+    # ─── Main entry point ─────────────────────────────────────────────────────
+
     def check_positions(self) -> list[dict]:
-        """
-        Main entry point — called every 5 minutes.
-        Returns list of actions taken.
-        """
+        """Called every 5 minutes. Returns list of actions taken."""
         if self.db is None:
             return []
 
-        from db.operations import get_open_trades, close_trade, log_decision, save_portfolio_snapshot
+        from db.operations import get_open_trades
+        from execution.order_tracker import confirm_fills
+
+        # 1. Promote confirmed fills, kill dead orders (phantom-trade fix)
+        fill_result = confirm_fills(self.db, self.broker)
+        if fill_result["confirmed"] or fill_result["cancelled"]:
+            print(f"  [monitor] fills: {fill_result}")
 
         open_trades = get_open_trades(self.db)
         if not open_trades:
             print(f"  [monitor] {datetime.utcnow().strftime('%H:%M')} — no open positions")
+            self._maybe_snapshot()
             return []
+
+        # 2. Batch live prices — ONE request for all symbols
+        from data.live_price import get_live_prices
+        symbols = list({t.symbol for t in open_trades})
+        prices  = get_live_prices(symbols, data_provider=self.data)
 
         actions = []
         for trade in open_trades:
-            action = self._check_trade(trade)
+            if self.broker.supports_bracket_orders:
+                action = self._reconcile_trade(trade, prices.get(trade.symbol))
+            else:
+                action = self._price_check_trade(trade, prices.get(trade.symbol))
             if action:
                 actions.append(action)
 
-        # Save portfolio snapshot every 6 checks (~30 min)
-        self._snapshot_counter += 1
-        if self._snapshot_counter >= 6:
-            self._save_snapshot()
-            self._snapshot_counter = 0
-
+        self._maybe_snapshot()
         return actions
 
-    def _get_live_price(self, symbol: str) -> Optional[float]:
-        """
-        Get the current intraday price.
-        Priority: Alpaca latest quote → Alpaca latest bar → daily bar fallback.
-        """
-        # Try Alpaca live quote first (most accurate during market hours)
-        try:
-            import os
-            from alpaca.data.historical import StockHistoricalDataClient
-            from alpaca.data.requests import StockLatestQuoteRequest
-            from alpaca.data.enums import DataFeed
-            api_key    = os.getenv("ALPACA_API_KEY")
-            secret_key = os.getenv("ALPACA_SECRET_KEY")
-            if api_key and not api_key.startswith("your_"):
-                client = StockHistoricalDataClient(api_key, secret_key)
-                req    = StockLatestQuoteRequest(symbol_or_symbols=symbol, feed=DataFeed.IEX)
-                quotes = client.get_stock_latest_quote(req)
-                if symbol in quotes:
-                    q = quotes[symbol]
-                    # Use mid-price of bid/ask
-                    bid = float(q.bid_price or 0)
-                    ask = float(q.ask_price or 0)
-                    if bid > 0 and ask > 0:
-                        return round((bid + ask) / 2, 2)
-                    elif ask > 0:
-                        return round(ask, 2)
-        except Exception:
-            pass
+    # ─── Reconciliation path (Alpaca — brackets own the exits) ────────────────
 
-        # Fallback: latest 1-minute bar from Alpaca
-        try:
-            import os
-            from alpaca.data.historical import StockHistoricalDataClient
-            from alpaca.data.requests import StockLatestBarRequest
-            from alpaca.data.enums import DataFeed
-            from datetime import datetime, timedelta
-            api_key    = os.getenv("ALPACA_API_KEY")
-            secret_key = os.getenv("ALPACA_SECRET_KEY")
-            if api_key and not api_key.startswith("your_"):
-                client = StockHistoricalDataClient(api_key, secret_key)
-                req    = StockLatestBarRequest(symbol_or_symbols=symbol, feed=DataFeed.IEX)
-                bars   = client.get_stock_latest_bar(req)
-                if symbol in bars:
-                    return round(float(bars[symbol].close), 2)
-        except Exception:
-            pass
+    def _reconcile_trade(self, trade, current_price: Optional[float]) -> Optional[dict]:
+        from db.operations import close_trade, log_decision, update_trade_excursions
 
-        # Final fallback: daily bar (mock mode or no credentials)
-        bar = self.data.fetch_latest_bar(symbol)
-        if bar and bar.get("close"):
-            return bar["close"]
+        try:
+            # A. Did a bracket leg fire since last check?
+            leg_fill = self._find_filled_exit_leg(trade)
+            if leg_fill:
+                exit_price, exit_reason, leg_type = leg_fill
+                closed = close_trade(self.db, trade.id,
+                                     exit_price=exit_price, exit_reason=exit_reason)
+                print(f"  [monitor] BRACKET {leg_type.upper()} FIRED — {trade.symbol} "
+                      f"@ ${exit_price:.2f} | PnL: ${closed.pnl:+.2f} ({closed.pnl_pct:+.2f}%)")
+                log_decision(
+                    self.db, agent="monitor", decision_type=exit_reason,
+                    symbol=trade.symbol, trade_id=trade.id,
+                    reasoning=f"Alpaca bracket {leg_type} leg filled at ${exit_price:.2f}",
+                    output={"exit_price": exit_price, "pnl": closed.pnl},
+                )
+                return {"symbol": trade.symbol, "exit_reason": exit_reason,
+                        "exit_price": exit_price, "pnl": closed.pnl}
+
+            # B. Position gone from Alpaca but no leg fill found?
+            #    (manual close, liquidation, sync gap) → reconcile at live price
+            position = self.broker.get_position(trade.symbol)
+            if position is None and current_price is not None:
+                closed = close_trade(self.db, trade.id,
+                                     exit_price=current_price, exit_reason="reconciled")
+                print(f"  [monitor] RECONCILED {trade.symbol} — position gone from "
+                      f"broker, closed @ ${current_price:.2f} | PnL: ${closed.pnl:+.2f}")
+                log_decision(
+                    self.db, agent="monitor", decision_type="reconciled",
+                    symbol=trade.symbol, trade_id=trade.id,
+                    reasoning="Position no longer exists at broker; no bracket fill found",
+                    output={"exit_price": current_price, "pnl": closed.pnl},
+                )
+                return {"symbol": trade.symbol, "exit_reason": "reconciled",
+                        "exit_price": current_price, "pnl": closed.pnl}
+
+            # C. Still open — track true excursions and log status
+            if current_price is not None and trade.entry_price:
+                is_long = trade.side.value == "buy"
+                pnl = (current_price - trade.entry_price) * trade.quantity * (1 if is_long else -1)
+                pnl_pct = (pnl / (trade.entry_price * trade.quantity)) * 100
+                update_trade_excursions(self.db, trade.id, pnl)
+                print(f"  [monitor] {trade.symbol}: ${current_price:.2f} | "
+                      f"unrealized {pnl:+.2f} ({pnl_pct:+.2f}%)")
+            return None
+
+        except Exception as e:
+            print(f"  [monitor] error reconciling {trade.symbol}: {e}")
+            return None
+
+    def _find_filled_exit_leg(self, trade) -> Optional[tuple]:
+        """
+        Check the parent order's bracket legs for a fill.
+        Returns (fill_price, exit_reason, leg_type) or None.
+        """
+        if not trade.alpaca_order_id:
+            return None
+        order = self.broker.get_order(trade.alpaca_order_id)
+        if not order:
+            return None
+
+        for leg in order.get("legs", []):
+            if str(leg.get("status", "")).lower() != "filled":
+                continue
+            fill_price = leg.get("filled_avg_price")
+            if not fill_price:
+                continue
+            leg_type = str(leg.get("order_type", "")).lower()
+            if "stop" in leg_type:
+                return (float(fill_price), "stop_hit", "stop")
+            else:  # limit leg = take profit
+                return (float(fill_price), "target_hit", "target")
         return None
 
-    def _check_trade(self, trade) -> Optional[dict]:
-        """Check a single trade against current live price. Returns action dict if closed."""
-        from db.operations import close_trade, log_decision
+    # ─── Price-check path (mock broker only — no server-side legs) ────────────
+
+    def _price_check_trade(self, trade, current_price: Optional[float]) -> Optional[dict]:
+        from db.operations import close_trade, log_decision, update_trade_excursions
 
         try:
-            # Get current LIVE price (intraday, not daily close)
-            current_price = self._get_live_price(trade.symbol)
             if current_price is None:
                 return None
-            side          = trade.side.value  # "buy" or "sell"
-            stop          = trade.planned_stop
-            target        = trade.planned_target
+            is_long = trade.side.value == "buy"
+            stop, target = trade.planned_stop, trade.planned_target
 
             exit_reason = None
-            is_long = side == "buy"
-
-            # Check stop loss
-            if stop is not None:
-                if (is_long and current_price <= stop) or \
-                   (not is_long and current_price >= stop):
-                    exit_reason = "stop_hit"
-
-            # Check take profit (only if stop wasn't hit)
-            if exit_reason is None and target is not None:
-                if (is_long and current_price >= target) or \
-                   (not is_long and current_price <= target):
-                    exit_reason = "target_hit"
+            if stop is not None and (
+                (is_long and current_price <= stop) or
+                (not is_long and current_price >= stop)
+            ):
+                exit_reason = "stop_hit"
+            elif target is not None and (
+                (is_long and current_price >= target) or
+                (not is_long and current_price <= target)
+            ):
+                exit_reason = "target_hit"
 
             if exit_reason is None:
-                # Position still open — log current status
                 if trade.entry_price:
                     pnl = (current_price - trade.entry_price) * trade.quantity * (1 if is_long else -1)
-                    pnl_pct = (pnl / (trade.entry_price * trade.quantity)) * 100
+                    update_trade_excursions(self.db, trade.id, pnl)
                     print(f"  [monitor] {trade.symbol}: ${current_price:.2f} | "
-                          f"unrealized {'+'if pnl>=0 else ''}{pnl:.2f} ({pnl_pct:+.2f}%)")
+                          f"unrealized {pnl:+.2f}")
                 return None
 
-            # Close the position
-            close_order = self.broker.close_position(trade.symbol)
-
-            # Calculate excursions
-            max_adverse   = None
-            max_favorable = None
-            if trade.entry_price:
-                pnl = (current_price - trade.entry_price) * trade.quantity * (1 if is_long else -1)
-                max_adverse   = min(0, pnl)
-                max_favorable = max(0, pnl)
-
-            closed = close_trade(
-                self.db, trade.id,
-                exit_price=current_price,
-                exit_reason=exit_reason,
-                max_adverse=max_adverse,
-                max_favorable=max_favorable,
-            )
-
-            pnl_str = f"{'+'if closed.pnl>=0 else ''}{closed.pnl:.2f}"
-            print(f"  [monitor] CLOSED {trade.symbol} — {exit_reason} @ ${current_price:.2f} | "
-                  f"PnL: ${pnl_str} ({closed.pnl_pct:+.2f}%)")
-
+            self.broker.close_position(trade.symbol)
+            closed = close_trade(self.db, trade.id,
+                                 exit_price=current_price, exit_reason=exit_reason)
+            print(f"  [monitor] CLOSED {trade.symbol} — {exit_reason} @ "
+                  f"${current_price:.2f} | PnL: ${closed.pnl:+.2f}")
             log_decision(
-                self.db,
-                agent="monitor",
-                decision_type=exit_reason,
-                symbol=trade.symbol,
-                trade_id=trade.id,
-                reasoning=f"{exit_reason} triggered at ${current_price:.2f}. "
-                           f"Entry was ${trade.entry_price:.2f}. PnL: ${closed.pnl:.2f}",
-                inputs={"current_price": current_price, "stop": stop, "target": target},
-                output={"exit_price": current_price, "pnl": closed.pnl, "pnl_pct": closed.pnl_pct},
+                self.db, agent="monitor", decision_type=exit_reason,
+                symbol=trade.symbol, trade_id=trade.id,
+                reasoning=f"{exit_reason} at ${current_price:.2f} (mock price-check path)",
+                output={"exit_price": current_price, "pnl": closed.pnl},
             )
-
-            return {
-                "symbol":      trade.symbol,
-                "exit_reason": exit_reason,
-                "exit_price":  current_price,
-                "pnl":         closed.pnl,
-            }
+            return {"symbol": trade.symbol, "exit_reason": exit_reason,
+                    "exit_price": current_price, "pnl": closed.pnl}
 
         except Exception as e:
             print(f"  [monitor] error checking {trade.symbol}: {e}")
             return None
 
+    # ─── Snapshots ────────────────────────────────────────────────────────────
+
+    def _maybe_snapshot(self):
+        self._snapshot_counter += 1
+        if self._snapshot_counter >= 6:   # every ~30 min
+            self._save_snapshot()
+            self._snapshot_counter = 0
+
     def _save_snapshot(self):
-        """Save current portfolio state to DB."""
         try:
             from db.operations import save_portfolio_snapshot
+            from db.models import PortfolioSnapshot
             acct      = self.broker.get_account()
             positions = self.broker.get_all_positions()
             pos_list  = [p for p in positions if p is not None]
 
-            # Calculate daily and total PnL from DB
-            from db.models import PortfolioSnapshot
             last = (self.db.query(PortfolioSnapshot)
                     .order_by(PortfolioSnapshot.timestamp.desc())
                     .first())
-
             start_equity = 100_000.0
             daily_pnl    = acct["equity"] - (last.equity if last else start_equity)
             total_pnl    = acct["equity"] - start_equity
 
             save_portfolio_snapshot(
-                self.db,
-                cash=acct["cash"],
-                equity=acct["equity"],
-                open_positions=pos_list,
-                daily_pnl=daily_pnl,
-                total_pnl=total_pnl,
+                self.db, cash=acct["cash"], equity=acct["equity"],
+                open_positions=pos_list, daily_pnl=daily_pnl, total_pnl=total_pnl,
             )
-            print(f"  [monitor] snapshot saved — equity=${acct['equity']:,.2f} "
-                  f"total_pnl={'+'if total_pnl>=0 else ''}{total_pnl:.2f}")
+            print(f"  [monitor] snapshot — equity=${acct['equity']:,.2f} "
+                  f"total_pnl={total_pnl:+.2f}")
         except Exception as e:
             print(f"  [monitor] snapshot failed: {e}")
 
+    # ─── End of day ───────────────────────────────────────────────────────────
+
     def end_of_day(self):
         """
-        4:15 PM ET routine.
-        Closes all remaining open positions (no overnight holds in paper mode).
-        Saves final portfolio snapshot.
+        4:15 PM ET routine — ORDER MATTERS here:
+          1. Cancel ALL open orders first. Closing a position while bracket
+             legs still hold the shares fails with 'insufficient qty
+             available'. Cancelling releases the shares.
+          2. Confirm any last-second fills / cancel stale pending trades.
+          3. Close remaining positions at the broker.
+          4. Close remaining OPEN trades in DB at live prices.
+          5. Snapshot + refresh stats.
         """
         from db.operations import get_open_trades, close_trade, log_decision
+        from execution.order_tracker import confirm_fills, cancel_stale_pending
+        from data.live_price import get_live_prices
+        import time
 
-        print("  [monitor] End of day — closing all open positions")
+        print("  [monitor] End of day — cancelling all open orders first")
+        cancelled = self.broker.cancel_all_orders()
+        print(f"  [monitor] cancelled {cancelled} open orders")
+        time.sleep(2)  # let cancellations settle before touching positions
+
+        # Reconcile last-second bracket fills before force-closing
+        confirm_fills(self.db, self.broker)
+        cancel_stale_pending(self.db, self.broker)
+
         open_trades = get_open_trades(self.db)
+        if not open_trades:
+            print("  [monitor] EOD — nothing left open")
+            self._save_snapshot()
+            self._refresh_stats()
+            return
+
+        symbols = list({t.symbol for t in open_trades})
+        prices  = get_live_prices(symbols, data_provider=self.data)
 
         for trade in open_trades:
             try:
-                bar = self.data.fetch_latest_bar(trade.symbol)
-                exit_price = bar["close"] if bar and bar.get("close") else trade.entry_price
-                is_long = trade.side.value == "buy"
+                # Check one last time whether a bracket leg fired
+                if self.broker.supports_bracket_orders:
+                    leg_fill = self._find_filled_exit_leg(trade)
+                    if leg_fill:
+                        exit_price, exit_reason, _ = leg_fill
+                        closed = close_trade(self.db, trade.id,
+                                             exit_price=exit_price, exit_reason=exit_reason)
+                        print(f"  [monitor] EOD found bracket fill {trade.symbol} "
+                              f"@ ${exit_price:.2f} | PnL: ${closed.pnl:+.2f}")
+                        continue
 
+                exit_price = prices.get(trade.symbol) or trade.entry_price
                 self.broker.close_position(trade.symbol)
-                closed = close_trade(
-                    self.db, trade.id,
-                    exit_price=exit_price,
-                    exit_reason="eod_close",
-                )
+                closed = close_trade(self.db, trade.id,
+                                     exit_price=exit_price, exit_reason="eod_close")
                 print(f"  [monitor] EOD closed {trade.symbol} @ ${exit_price:.2f} | "
-                      f"PnL: ${closed.pnl:.2f}")
+                      f"PnL: ${closed.pnl:+.2f}")
                 log_decision(
                     self.db, agent="monitor", decision_type="eod_close",
                     symbol=trade.symbol, trade_id=trade.id,
@@ -258,10 +304,10 @@ class PositionMonitor:
             except Exception as e:
                 print(f"  [monitor] EOD close failed for {trade.symbol}: {e}")
 
-        # Final snapshot
         self._save_snapshot()
+        self._refresh_stats()
 
-        # Refresh strategy stats
+    def _refresh_stats(self):
         try:
             from db.operations import refresh_strategy_stats
             refresh_strategy_stats(self.db)

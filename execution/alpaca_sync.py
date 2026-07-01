@@ -65,10 +65,14 @@ def _sync_open_positions(client, db) -> int:
     for pos in positions:
         symbol = pos.symbol
 
-        # Check if we already have an open trade for this symbol
+        # Check if we already track this symbol — either as a confirmed OPEN
+        # trade or as a PENDING_FILL awaiting the order tracker. Without the
+        # PENDING_FILL check, sync would create a DUPLICATE trade record for
+        # a position the tracker is about to promote.
         existing = (db.query(Trade)
                     .filter(Trade.symbol == symbol,
-                            Trade.status == TradeStatus.OPEN)
+                            Trade.status.in_([TradeStatus.OPEN,
+                                              TradeStatus.PENDING_FILL]))
                     .first())
         if existing:
             continue  # already tracked

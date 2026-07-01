@@ -20,9 +20,10 @@ class OrderSide(str, enum.Enum):
     SELL = "sell"
 
 class TradeStatus(str, enum.Enum):
-    OPEN = "open"
+    PENDING_FILL = "pending_fill"   # order accepted by broker, not yet filled
+    OPEN = "open"                   # fill confirmed — this is a real position
     CLOSED = "closed"
-    CANCELLED = "cancelled"
+    CANCELLED = "cancelled"         # order expired/cancelled without filling
 
 class SetupType(str, enum.Enum):
     ORB = "orb"               # Opening Range Breakout

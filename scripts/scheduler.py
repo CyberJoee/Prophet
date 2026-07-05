@@ -61,6 +61,20 @@ def morning_pipeline():
         watchlist = get_watchlist(db)
         print(f"Watchlist: {', '.join(watchlist)}\n")
 
+        # Regime gate — market-level go/no-go before anything else
+        from agents.regime import assess_regime
+        regime = assess_regime(dp)
+        print(f"Regime: trend={regime['trend']} vol={regime['vol_regime']} "
+              f"risk_scale={regime['risk_scale']:.0%}")
+        for r in regime["reasons"]:
+            print(f"  • {r}")
+        if not regime["trade_allowed"]:
+            print("Regime gate CLOSED — skipping research and strategy today.")
+            from db.operations import log_decision
+            log_decision(db, agent="regime", decision_type="no_trade_day",
+                         reasoning="; ".join(regime["reasons"]), output=regime)
+            return
+
         # Research
         print("Running research scan...")
         research = ResearchAgent(data_provider=dp, db_session=db)
@@ -76,13 +90,27 @@ def morning_pipeline():
             briefing = research.run_mock()
             print(f"  [MOCK] mood={briefing['market_mood']}")
 
+        # Earnings guard — drop opportunities reporting within 2 days
+        try:
+            from agents.earnings_guard import filter_earnings_risk
+            opp_symbols = [o["symbol"] for o in briefing.get("opportunities", [])]
+            safe, blocked = filter_earnings_risk(opp_symbols, within_days=2)
+            if blocked:
+                briefing["opportunities"] = [
+                    o for o in briefing["opportunities"] if o["symbol"] in safe]
+                briefing.setdefault("avoid", []).extend(blocked.keys())
+                briefing["avoid_reason"] = (briefing.get("avoid_reason") or "") + \
+                    f" Earnings guard blocked: {blocked}."
+        except Exception as e:
+            print(f"  [earnings] guard failed open: {e}")
+
         # Strategy
         print("Running strategy evaluation...")
         strategy = StrategyAgent(data_provider=dp, db_session=db, execution_client=broker)
         decision = None
         if is_llm_available():
             try:
-                decision = strategy.run(briefing)
+                decision = strategy.run(briefing, regime=regime)
                 print(f"  [LIVE] {len(decision['trades'])} trades planned, "
                       f"{len(decision['executed'])} executed")
             except Exception as e:

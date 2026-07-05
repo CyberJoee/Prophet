@@ -2,6 +2,7 @@
 Database operations layer.
 All agents write through here — no raw SQL in agent code.
 """
+import os
 from datetime import datetime
 from typing import Optional
 from sqlalchemy.orm import Session
@@ -229,14 +230,46 @@ def log_decision(db: Session, agent: str, decision_type: str,
 # ─── Strategy Stats ────────────────────────────────────────────────────────────
 
 def refresh_strategy_stats(db: Session):
-    """Recompute win rate, expectancy, profit factor for each setup type."""
+    """
+    Recompute win rate, expectancy, profit factor for each setup type.
+
+    STATS CUTOFF: only trades entered on/after STATS_SINCE are counted.
+    The 67 trades recorded before 2026-07-02 came from the broken execution
+    path (no real bracket legs, phantom fills, polling exits) — they describe
+    a system that no longer exists and would poison the LLM's view of which
+    setups work. Override via env var STATS_SINCE=YYYY-MM-DD.
+    """
+    cutoff_str = os.getenv("STATS_SINCE", "2026-07-02")
+    try:
+        cutoff = datetime.strptime(cutoff_str, "%Y-%m-%d")
+    except ValueError:
+        print(f"  [stats] invalid STATS_SINCE '{cutoff_str}' — using no cutoff")
+        cutoff = datetime(1970, 1, 1)
+
     for setup in SetupType:
         trades = (
             db.query(Trade)
-            .filter(Trade.status == TradeStatus.CLOSED, Trade.setup_type == setup)
+            .filter(Trade.status == TradeStatus.CLOSED,
+                    Trade.setup_type == setup,
+                    Trade.entry_time >= cutoff)
             .all()
         )
+        # Reset stale stats for setups with no post-cutoff trades, so old
+        # numbers don't linger in the LLM's context
         if not trades:
+            stats = db.query(StrategyStats).filter(StrategyStats.setup_type == setup).first()
+            if stats and stats.total_trades:
+                stats.total_trades = 0
+                stats.winning_trades = 0
+                stats.win_rate = 0
+                stats.avg_win = 0
+                stats.avg_loss = 0
+                stats.expectancy = 0
+                stats.profit_factor = 0
+                stats.total_pnl = 0
+                stats.largest_win = 0
+                stats.largest_loss = 0
+                stats.last_updated = datetime.utcnow()
             continue
         wins = [t for t in trades if t.pnl and t.pnl > 0]
         losses = [t for t in trades if t.pnl and t.pnl <= 0]

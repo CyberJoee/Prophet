@@ -108,11 +108,17 @@ class TradePlan(BaseModel):
 
 
 def build_trade_plan(pick: LLMPick, live_price: float, atr: float,
-                     equity: float, risk_budget_left: float) -> Optional[TradePlan]:
+                     equity: float, risk_budget_left: float,
+                     risk_scale: float = 1.0) -> Optional[TradePlan]:
     """
     Turn a validated LLM pick into an executable plan using the LIVE quote.
+    risk_scale (0-1) comes from the regime gate — scales dollar risk down
+    in hostile conditions. 0 means no trade.
     Returns None (with a printed reason) if the trade can't be sized sanely.
     """
+    if risk_scale <= 0:
+        print(f"  [sizing] {pick.symbol}: risk_scale is 0 (regime gate) — skipping")
+        return None
     if live_price is None or live_price <= 0:
         print(f"  [sizing] {pick.symbol}: no live price — skipping")
         return None
@@ -143,8 +149,9 @@ def build_trade_plan(pick: LLMPick, live_price: float, atr: float,
     if not is_long and not (target < live_price < stop):
         return None
 
-    # Position size: 2% risk, capped by 15% of equity and remaining budget
-    risk_dollars = min(equity * RISK_PER_TRADE_PCT, risk_budget_left)
+    # Position size: 2% risk scaled by regime, capped by 15% of equity
+    # and remaining session budget
+    risk_dollars = min(equity * RISK_PER_TRADE_PCT * risk_scale, risk_budget_left)
     qty = int(risk_dollars / stop_dist)
     qty = min(qty, int((equity * MAX_POSITION_PCT) / live_price))
     if qty < 1:

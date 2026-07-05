@@ -57,8 +57,14 @@ opportunities and are not on the avoid list.
 
 
 def _build_strategy_prompt(briefing: dict, account: dict,
-                           similar_trades: list[dict], stats_summary: str = "") -> str:
+                           similar_trades: list[dict], stats_summary: str = "",
+                           regime: dict = None) -> str:
     parts = []
+
+    if regime is not None:
+        from agents.regime import format_regime_for_prompt
+        parts.append(format_regime_for_prompt(regime))
+        parts.append("")
 
     parts.append("PORTFOLIO STATUS:")
     parts.append(f"  Cash: ${account.get('cash', 0):,.2f}")
@@ -120,17 +126,24 @@ class StrategyAgent:
 
     # ─── Main pipeline ─────────────────────────────────────────────────────────
 
-    def run(self, briefing: dict) -> dict:
+    def run(self, briefing: dict, regime: dict = None) -> dict:
         """
-        1. LLM picks setups (judgment only)
+        1. LLM picks setups (judgment only) — regime context included in prompt
         2. Pydantic + business rules validate the picks
-        3. Code sizes each trade from live quote + ATR
+        3. Code sizes each trade from live quote + ATR, scaled by regime
         4. Orders placed, trades recorded as PENDING_FILL
         """
         from execution.sizing import (
             validate_llm_decision, build_trade_plan, MAX_SESSION_RISK_PCT
         )
         from data.live_price import get_live_prices
+
+        if regime is not None and not regime.get("trade_allowed", True):
+            result = {"trades": [], "executed": [],
+                      "skip_reason": "regime gate: " + "; ".join(regime.get("reasons", [])),
+                      "decided_at": datetime.utcnow().isoformat()}
+            self._log(briefing, result)
+            return result
 
         account = self.broker.get_account()
         equity  = account.get("equity", account.get("cash", 100_000))
@@ -139,7 +152,8 @@ class StrategyAgent:
         similar, stats_summary = self._gather_context(briefing)
 
         # 1-2. LLM call + validation
-        prompt = _build_strategy_prompt(briefing, account, similar, stats_summary)
+        prompt = _build_strategy_prompt(briefing, account, similar, stats_summary,
+                                        regime=regime)
         raw = self._call_llm(prompt)
         try:
             decision = validate_llm_decision(raw, briefing)
@@ -156,20 +170,25 @@ class StrategyAgent:
             self._log(briefing, result)
             return result
 
-        # 3. Deterministic sizing from LIVE quotes
+        # 3. Deterministic sizing from LIVE quotes, scaled by regime
         symbols = [p.symbol for p in decision.picks]
         prices  = get_live_prices(symbols, data_provider=self.data)
         atrs    = self._get_atrs(symbols)
 
-        risk_budget = equity * MAX_SESSION_RISK_PCT
+        base_scale = regime.get("risk_scale", 1.0) if regime else 1.0
+        long_scale = regime.get("long_scale", 1.0) if regime else 1.0
+
+        risk_budget = equity * MAX_SESSION_RISK_PCT * base_scale
         plans = []
         for pick in decision.picks:
+            scale = base_scale * (long_scale if pick.direction == "long" else 1.0)
             plan = build_trade_plan(
                 pick,
                 live_price=prices.get(pick.symbol),
                 atr=atrs.get(pick.symbol),
                 equity=equity,
                 risk_budget_left=risk_budget,
+                risk_scale=scale,
             )
             if plan:
                 plans.append(plan)

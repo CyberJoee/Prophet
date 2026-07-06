@@ -220,3 +220,25 @@ class PortfolioSnapshot(Base):
     daily_pnl = Column(Float, nullable=True)
     total_pnl = Column(Float, nullable=True)        # vs starting capital
     created_at = Column(DateTime, default=datetime.utcnow)
+
+# ─── Alternative Data Signals ─────────────────────────────────────────────────
+
+class AltSignal(Base):
+    """
+    Daily snapshot of differentiated data signals per symbol per source.
+    Collected every morning BEFORE the trading decision; evaluated later
+    against forward returns (scripts/eval_signals.py) to determine which
+    signals actually predict before they're allowed to influence sizing.
+    """
+    __tablename__ = "alt_signals"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    signal_date = Column(DateTime, nullable=False)   # trading date (00:00 UTC)
+    symbol = Column(String(20), nullable=False)      # or "_MACRO" for market-wide
+    source = Column(String(30), nullable=False)      # options_flow | short_volume | event_risk
+    metrics = Column(JSON, nullable=False)            # source-specific numbers
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_altsignals_lookup", "symbol", "source", "signal_date"),
+    )

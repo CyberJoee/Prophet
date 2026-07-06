@@ -75,6 +75,22 @@ def morning_pipeline():
                          reasoning="; ".join(regime["reasons"]), output=regime)
             return
 
+        # Alternative data signals — collect, store, and brief the LLM.
+        # Macro event risk scales sizing IN CODE (defensive gate, like regime).
+        alt = {"text": "", "event_scale": 1.0}
+        try:
+            from data.alt_signals.aggregator import collect_all
+            alt = collect_all(db, watchlist)
+            if alt["text"]:
+                print(alt["text"])
+            if alt["event_scale"] < 1.0:
+                regime["risk_scale"] *= alt["event_scale"]
+                regime["reasons"].append(
+                    f"Macro event risk — sizes scaled to {regime['risk_scale']:.0%}")
+                print(f"  [alt] event risk: risk_scale now {regime['risk_scale']:.0%}")
+        except Exception as e:
+            print(f"  [alt] signal collection failed open: {e}")
+
         # Research
         print("Running research scan...")
         research = ResearchAgent(data_provider=dp, db_session=db)
@@ -103,6 +119,10 @@ def morning_pipeline():
                     f" Earnings guard blocked: {blocked}."
         except Exception as e:
             print(f"  [earnings] guard failed open: {e}")
+
+        # Attach alt-signal context so the strategy LLM sees it
+        if alt.get("text"):
+            briefing["alt_signals_text"] = alt["text"]
 
         # Strategy
         print("Running strategy evaluation...")

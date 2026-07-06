@@ -66,6 +66,10 @@ def _build_strategy_prompt(briefing: dict, account: dict,
         parts.append(format_regime_for_prompt(regime))
         parts.append("")
 
+    if briefing.get("alt_signals_text"):
+        parts.append(briefing["alt_signals_text"])
+        parts.append("")
+
     parts.append("PORTFOLIO STATUS:")
     parts.append(f"  Cash: ${account.get('cash', 0):,.2f}")
     parts.append(f"  Equity: ${account.get('equity', 0):,.2f}")

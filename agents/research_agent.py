@@ -42,6 +42,32 @@ Return at most 5 opportunities. Only include high-conviction setups.
 """
 
 
+def _age_label(published_at) -> str:
+    """
+    '2h ago' / '35m ago' — recency is real information for an intraday
+    decision; the old '(None)' sentiment placeholder was not.
+    Tolerates datetime (naive or tz-aware), ISO string, or missing.
+    """
+    from datetime import datetime, timezone
+    if published_at is None:
+        return "time unknown"
+    try:
+        if isinstance(published_at, str):
+            published_at = datetime.fromisoformat(published_at.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        if published_at.tzinfo is None:
+            published_at = published_at.replace(tzinfo=timezone.utc)
+        mins = max(0, int((now - published_at).total_seconds() // 60))
+        if mins < 60:
+            return f"{mins}m ago"
+        hours = mins / 60
+        if hours < 24:
+            return f"{hours:.0f}h ago"
+        return f"{hours/24:.0f}d ago"
+    except Exception:
+        return "time unknown"
+
+
 def _build_research_prompt(watchlist_data: list[dict], news: dict) -> str:
     lines = ["WATCHLIST SCAN RESULTS:\n"]
     for d in watchlist_data:
@@ -81,8 +107,8 @@ def _build_research_prompt(watchlist_data: list[dict], news: dict) -> str:
                 bb_signal = "upper half of BB" if close > mid else "lower half of BB"
 
         sym_news = news.get(sym, [])
-        news_line = " | ".join([f"\"{n['headline']}\" ({n['sentiment_label']})"
-                                 for n in sym_news[:2]]) if sym_news else "No news"
+        news_line = " | ".join([f"\"{n['headline']}\" ({_age_label(n.get('published_at'))})"
+                                 for n in sym_news[:2]]) if sym_news else "No news in last 18h"
 
         if close is None:
             continue

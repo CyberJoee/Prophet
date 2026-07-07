@@ -265,13 +265,22 @@ class AlpacaDataProvider(DataProvider):
         # Alpaca doesn't supply fundamentals; add Polygon.io key for full data
         return {"symbol": symbol, "sector": None, "market_cap": None, "pe_ratio": None}
 
-    def fetch_news(self, symbol: str, limit: int = 10) -> list[dict]:
+    def fetch_news(self, symbol: str, limit: int = 10,
+                   max_age_hours: int = 18) -> list[dict]:
+        """
+        Fetch recent news for a symbol. Only articles published within
+        max_age_hours qualify — for an intraday system, stale news is worse
+        than no news: a 4-day-old headline presented alongside this
+        morning's looks identical to the LLM and gets re-traded.
+        """
         try:
+            from datetime import datetime, timedelta, timezone
             from alpaca.data.historical import NewsClient
             from alpaca.data.requests import NewsRequest
             client = NewsClient(os.getenv("ALPACA_API_KEY"), os.getenv("ALPACA_SECRET_KEY"))
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
             # NewsRequest expects symbols as a string, not a list
-            req = NewsRequest(symbols=symbol, limit=limit)
+            req = NewsRequest(symbols=symbol, limit=limit, start=cutoff)
             news = client.get_news(req)
             return [
                 {
@@ -280,8 +289,6 @@ class AlpacaDataProvider(DataProvider):
                     "summary":         getattr(n, "summary", None),
                     "published_at":    n.created_at,
                     "url":             n.url,
-                    "sentiment_score": None,
-                    "sentiment_label": None,
                 }
                 for n in getattr(news, "news", [])
             ]

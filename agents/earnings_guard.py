@@ -53,11 +53,18 @@ def filter_earnings_risk(symbols: list[str], within_days: int = 2) -> tuple[list
     if os.getenv("EARNINGS_GUARD", "on").lower() in ("off", "0", "false"):
         return symbols, {}
 
+    # ETFs have no earnings; yfinance prints noisy 404s when asked
+    ETFS = {"SPY", "QQQ", "DIA", "IWM", "VTI", "VOO", "XLK", "XLF", "XLE",
+            "SMH", "ARKK", "TQQQ", "SQQQ", "GLD", "SLV", "TLT", "HYG"}
+
     today = datetime.utcnow().date()
     horizon = today + timedelta(days=within_days)
 
     safe, blocked = [], {}
     for sym in symbols:
+        if sym.upper() in ETFS:
+            safe.append(sym)
+            continue
         edate = _earnings_date_for(sym)
         if edate is not None and today <= edate <= horizon:
             blocked[sym] = edate.isoformat()

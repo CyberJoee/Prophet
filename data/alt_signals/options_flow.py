@@ -69,7 +69,11 @@ def collect_options_flow(symbol: str) -> Optional[dict]:
                 calls = chain.calls.dropna(subset=["impliedVolatility"])
                 if not calls.empty:
                     idx = (calls["strike"] - spot).abs().idxmin()
-                    atm_iv = round(float(calls.loc[idx, "impliedVolatility"]), 4)
+                    iv = float(calls.loc[idx, "impliedVolatility"])
+                    # yfinance often reports ~0 IV shortly after the open
+                    # before chain quotes populate; storing zeros poisons the
+                    # trailing baseline (seen live: '+252400% vs recent avg')
+                    atm_iv = round(iv, 4) if iv >= 0.01 else None
 
         total = call_vol + put_vol
         if total < 500:                          # too thin to mean anything
@@ -108,7 +112,9 @@ def describe(symbol: str, m: dict, baseline: Optional[dict] = None) -> str:
         bits.append(f"{m['unusual_contracts']} unusual-volume contracts{side}")
     if m.get("atm_iv") is not None:
         iv_note = f"ATM IV {m['atm_iv']:.0%}"
-        if baseline and baseline.get("atm_iv"):
+        # Only compare when the baseline is meaningful — a near-zero baseline
+        # (early poisoned snapshots) produces absurd percentages
+        if baseline and (baseline.get("atm_iv") or 0) >= 0.05:
             chg = m["atm_iv"] / baseline["atm_iv"] - 1
             if abs(chg) > 0.15:
                 iv_note += f" ({chg:+.0%} vs recent avg — market expects movement)"

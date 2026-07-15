@@ -255,7 +255,12 @@ class AlpacaDataProvider(DataProvider):
             return []
 
     def fetch_latest_bar(self, symbol: str) -> Optional[dict]:
-        bars = self.fetch_bars(symbol, days=5, interval="1d")
+        # 60 calendar days ≈ 40 trading bars — enough history for ATR(14),
+        # RSI(14), BB(20), and MACD(26+9) to produce real values. The old
+        # days=5 computed 14-period indicators on 5 rows: every indicator
+        # came back NaN→None, which starved the sizing engine ('no ATR')
+        # and fed the research LLM None for every technical since v1.
+        bars = self.fetch_bars(symbol, days=60, interval="1d")
         return bars[-1] if bars else None
 
     def fetch_intraday(self, symbol: str, days_back: int = 5, interval: str = "5m") -> list[dict]:

@@ -95,16 +95,35 @@ def morning_pipeline():
         print("Running research scan...")
         research = ResearchAgent(data_provider=dp, db_session=db)
         briefing = None
+        llm_broken = False
         if is_llm_available():
             try:
                 briefing = research.run()
                 print(f"  [LIVE] mood={briefing['market_mood']} "
                       f"opps={[o['symbol'] for o in briefing['opportunities']]}")
             except Exception as e:
-                print(f"  [LIVE] research failed: {e} — using mock")
-        if briefing is None:
+                # A configured LLM that ERRORS (bad model name, deprecation,
+                # rate limit, auth) is a different situation from "no LLM
+                # configured" — silently substituting mock trades here means
+                # templated, non-reasoned decisions get placed and recorded
+                # as if the LLM had made them, corrupting stats exactly like
+                # the phantom-trade bug did. Make this LOUD instead.
+                llm_broken = True
+                print("  " + "!" * 60)
+                print(f"  [ALERT] LLM CALL FAILED: {e}")
+                print("  [ALERT] Skipping today's trading — NOT falling back "
+                      "to mock decisions in production.")
+                print("  " + "!" * 60)
+                from db.operations import log_decision
+                log_decision(db, agent="research", decision_type="llm_unavailable",
+                             reasoning=f"LLM call failed: {e}")
+        if briefing is None and not llm_broken:
             briefing = research.run_mock()
-            print(f"  [MOCK] mood={briefing['market_mood']}")
+            print(f"  [MOCK] mood={briefing['market_mood']} (LLM not configured)")
+        if llm_broken:
+            print("Morning pipeline aborted — fix GROQ_MODEL / API key and "
+                  "the scheduled run will pick back up tomorrow.")
+            return
 
         # Earnings guard — drop opportunities reporting within 2 days
         try:
@@ -134,10 +153,20 @@ def morning_pipeline():
                 print(f"  [LIVE] {len(decision['trades'])} trades planned, "
                       f"{len(decision['executed'])} executed")
             except Exception as e:
-                print(f"  [LIVE] strategy failed: {e} — using mock")
-        if decision is None:
+                print("  " + "!" * 60)
+                print(f"  [ALERT] LLM CALL FAILED: {e}")
+                print("  [ALERT] Skipping today's trading — NOT falling back "
+                      "to mock decisions in production.")
+                print("  " + "!" * 60)
+                from db.operations import log_decision
+                log_decision(db, agent="strategy", decision_type="llm_unavailable",
+                             reasoning=f"LLM call failed: {e}")
+                print("Morning pipeline aborted after research succeeded but "
+                      "strategy failed — check GROQ_MODEL / rate limits.")
+                return
+        else:
             decision = strategy.run_mock(briefing)
-            print(f"  [MOCK] {len(decision['trades'])} trades")
+            print(f"  [MOCK] {len(decision['trades'])} trades (LLM not configured)")
 
         for t in decision.get("trades", []):
             try:

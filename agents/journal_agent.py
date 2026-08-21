@@ -97,8 +97,9 @@ class JournalAgent:
     def _call_llm(self, trade, similar_past) -> dict:
         prompt = _build_journal_prompt(trade, similar_past)
         client = self._get_groq()
+        from agents.llm_client import DEFAULT_MODEL
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model=os.getenv("GROQ_MODEL", DEFAULT_MODEL),
             max_tokens=800,
             temperature=0.3,
             messages=[

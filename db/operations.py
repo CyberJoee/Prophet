@@ -229,22 +229,36 @@ def log_decision(db: Session, agent: str, decision_type: str,
 
 # ─── Strategy Stats ────────────────────────────────────────────────────────────
 
+def get_stats_cutoff() -> datetime:
+    """
+    Trades entered before this date are excluded from every performance
+    number the system reports.
+
+    The 67 trades recorded before 2026-07-02 came from the broken execution
+    path (no real bracket legs, phantom fills, polling exits). They describe
+    a system that no longer exists, and counting them poisons both the LLM's
+    view of which setups work and the dashboard's headline P&L.
+
+    Override via env var STATS_SINCE=YYYY-MM-DD. Single source of truth —
+    refresh_strategy_stats() and dashboard/api.py both call this, so the
+    dashboard summary can never again disagree with its own per-setup rows.
+    """
+    cutoff_str = os.getenv("STATS_SINCE", "2026-07-02")
+    try:
+        return datetime.strptime(cutoff_str, "%Y-%m-%d")
+    except ValueError:
+        print(f"  [stats] invalid STATS_SINCE '{cutoff_str}' — using no cutoff")
+        return datetime(1970, 1, 1)
+
+
 def refresh_strategy_stats(db: Session):
     """
     Recompute win rate, expectancy, profit factor for each setup type.
 
-    STATS CUTOFF: only trades entered on/after STATS_SINCE are counted.
-    The 67 trades recorded before 2026-07-02 came from the broken execution
-    path (no real bracket legs, phantom fills, polling exits) — they describe
-    a system that no longer exists and would poison the LLM's view of which
-    setups work. Override via env var STATS_SINCE=YYYY-MM-DD.
+    STATS CUTOFF: only trades entered on/after STATS_SINCE are counted —
+    see get_stats_cutoff() for why.
     """
-    cutoff_str = os.getenv("STATS_SINCE", "2026-07-02")
-    try:
-        cutoff = datetime.strptime(cutoff_str, "%Y-%m-%d")
-    except ValueError:
-        print(f"  [stats] invalid STATS_SINCE '{cutoff_str}' — using no cutoff")
-        cutoff = datetime(1970, 1, 1)
+    cutoff = get_stats_cutoff()
 
     for setup in SetupType:
         trades = (

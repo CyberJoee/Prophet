@@ -204,19 +204,36 @@ def get_performance():
     """Strategy performance stats — win rate, expectancy, profit factor per setup."""
     from db.connection import SessionLocal
     from db.models import StrategyStats, Trade, TradeStatus
+    from db.operations import get_stats_cutoff
 
     db = SessionLocal()
     try:
         stats = db.query(StrategyStats).filter(StrategyStats.total_trades > 0).all()
-        total_trades = db.query(Trade).filter(Trade.status == TradeStatus.CLOSED).count()
-        total_pnl    = sum(
-            t.pnl for t in db.query(Trade).filter(Trade.status == TradeStatus.CLOSED).all()
-            if t.pnl is not None
-        )
+
+        # Apply the SAME cutoff the per-setup stats below already use. Without
+        # it the summary counted the 67 corrupted pre-v2 trades (phantom fills,
+        # fabricated exits) that StrategyStats deliberately excludes — so this
+        # endpoint reported ~+$4,543 while /api/portfolio, reading real Alpaca
+        # equity, reported ~+$1,710. Same response, two contradictory numbers.
+        cutoff = get_stats_cutoff()
+        counted = (db.query(Trade)
+                     .filter(Trade.status == TradeStatus.CLOSED,
+                             Trade.entry_time >= cutoff)
+                     .all())
+        total_trades = len(counted)
+        total_pnl    = sum(t.pnl for t in counted if t.pnl is not None)
+
+        excluded = (db.query(Trade)
+                      .filter(Trade.status == TradeStatus.CLOSED,
+                              Trade.entry_time < cutoff)
+                      .count())
+
         return {
             "summary": {
-                "total_trades": total_trades,
-                "total_pnl":    round(total_pnl, 2),
+                "total_trades":  total_trades,
+                "total_pnl":     round(total_pnl, 2),
+                "stats_since":   cutoff.strftime("%Y-%m-%d"),
+                "excluded_pre_cutoff_trades": excluded,
             },
             "by_setup": [
                 {

@@ -138,6 +138,42 @@ def _sync_open_positions(client, db) -> int:
     return count
 
 
+def _already_recorded(db, symbol, sell, entry_id, entry_price) -> bool:
+    """
+    True if this Alpaca fill is already in the trades table.
+
+    Checks the order id from BOTH legs, because a closed trade can reach the
+    DB by two routes that store different ids in `alpaca_order_id`:
+      - strategy_agent/order_tracker store the ENTRY (buy) order id
+      - a previous alpaca_sync run stored the EXIT (sell) order id
+
+    The original code checked only the sell id, so it never recognised a
+    natively-tracked trade and re-imported one duplicate row per sync run —
+    the source of the phantom P&L gap on the dashboard.
+    """
+    from sqlalchemy import func
+    from db.models import Trade, TradeStatus
+
+    ids = [i for i in (sell["id"], entry_id) if i]
+    if ids and (db.query(Trade)
+                  .filter(Trade.alpaca_order_id.in_(ids))
+                  .first()):
+        return True
+
+    # Fallback for legacy rows that carry no order id at all: match the fill
+    # itself (symbol + qty + both prices) against existing CLOSED trades.
+    if entry_price is None:
+        return False
+    match = (db.query(Trade)
+               .filter(Trade.symbol == symbol,
+                       Trade.status == TradeStatus.CLOSED,
+                       Trade.quantity == sell["qty"],
+                       func.abs(Trade.entry_price - entry_price) < 0.01,
+                       func.abs(Trade.exit_price - sell["price"]) < 0.01)
+               .first())
+    return match is not None
+
+
 def _sync_closed_orders(client, db) -> int:
     """Pull filled+closed orders from Alpaca and create closed trade records."""
     from alpaca.trading.requests import GetOrdersRequest
@@ -185,22 +221,38 @@ def _sync_closed_orders(client, db) -> int:
 
     # For each sell, find the matching buy and create a closed trade
     for sym, sells in sell_orders.items():
-        buys = buy_orders.get(sym, [])
-        for sell in sells:
-            # Check if already recorded by order ID
-            existing = (db.query(Trade)
-                        .filter(Trade.alpaca_order_id == sell["id"])
-                        .first())
-            if existing:
+        buys = sorted(buy_orders.get(sym, []),
+                      key=lambda b: b["time"] or datetime.utcnow())
+        used_buy_ids = set()
+
+        for sell in sorted(sells, key=lambda s: s["time"] or datetime.utcnow()):
+            # Match the entry leg FIRST — the dedup check below needs the buy
+            # order id, since that is what natively-tracked trades store.
+            entry_price = None
+            entry_time  = None
+            entry_id    = None
+            for buy in buys:
+                if buy["id"] in used_buy_ids:
+                    continue  # one buy fill can only open one trade
+                buy_time  = buy["time"]
+                sell_time = sell["time"]
+                if buy_time and sell_time and buy_time <= sell_time:
+                    entry_price = buy["price"]
+                    entry_time  = buy_time
+                    entry_id    = buy["id"]
+            if entry_id:
+                used_buy_ids.add(entry_id)
+
+            if _already_recorded(db, sym, sell, entry_id, entry_price):
                 continue
 
-            # Also check if there's an open trade we should close instead
+            # An OPEN record for this symbol means the tracker opened the trade
+            # but never saw the exit — close that row instead of inserting one.
             open_trade_rec = (db.query(Trade)
                               .filter(Trade.symbol == sym,
                                       Trade.status == TradeStatus.OPEN)
                               .first())
-            if open_trade_rec and entry_price:
-                # Close the existing open trade record
+            if open_trade_rec:
                 from db.operations import close_trade
                 try:
                     close_trade(db, open_trade_rec.id,
@@ -209,22 +261,11 @@ def _sync_closed_orders(client, db) -> int:
                     count += 1
                     print(f"  [sync] Closed existing open trade: {sym} PnL=${sell['price']-open_trade_rec.entry_price:.2f}/share")
                     continue
-                except Exception:
-                    pass
+                except Exception as e:
+                    db.rollback()
+                    print(f"  [sync] Failed to close open trade {sym}: {e}")
 
-            # Find best matching buy (closest in time before the sell)
-            entry_price = None
-            entry_time  = None
-            entry_id    = None
-            for buy in sorted(buys, key=lambda b: b["time"] or datetime.utcnow()):
-                buy_time  = buy["time"]
-                sell_time = sell["time"]
-                if buy_time and sell_time and buy_time <= sell_time:
-                    entry_price = buy["price"]
-                    entry_time  = buy_time
-                    entry_id    = buy["id"]
-
-            if not entry_price:
+            if entry_price is None:
                 entry_price = sell["price"] * 0.99  # fallback estimate
                 entry_time  = sell["time"]
 

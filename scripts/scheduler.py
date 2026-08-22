@@ -75,6 +75,19 @@ def morning_pipeline():
                          reasoning="; ".join(regime["reasons"]), output=regime)
             return
 
+        # Expectancy gate — per-setup go/no-go from realised R. This is the
+        # only mechanism that changes behaviour from outcomes without an LLM
+        # in the loop; it is enforced in strategy_agent, not merely prompted.
+        from agents.expectancy_gate import assess_setups, format_expectancy_for_log
+        expectancy = assess_setups(db)
+        for line in format_expectancy_for_log(expectancy):
+            print(line)
+        if expectancy.get("suspended"):
+            from db.operations import log_decision
+            log_decision(db, agent="expectancy", decision_type="setups_suspended",
+                         reasoning="suspended: " + ", ".join(expectancy["suspended"]),
+                         output=expectancy)
+
         # Alternative data signals — collect, store, and brief the LLM.
         # Macro event risk scales sizing IN CODE (defensive gate, like regime).
         alt = {"text": "", "event_scale": 1.0}
@@ -149,7 +162,8 @@ def morning_pipeline():
         decision = None
         if is_llm_available():
             try:
-                decision = strategy.run(briefing, regime=regime)
+                decision = strategy.run(briefing, regime=regime,
+                                        expectancy=expectancy)
                 print(f"  [LIVE] {len(decision['trades'])} trades planned, "
                       f"{len(decision['executed'])} executed")
             except Exception as e:

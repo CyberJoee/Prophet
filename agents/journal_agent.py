@@ -175,21 +175,39 @@ class JournalAgent:
         similar_raw  = self._get_similar_trades(trade)
         similar_list = self._format_similar(similar_raw)
 
-        # Call LLM for analysis
+        # Call LLM for analysis.
+        #
+        # FAIL LOUD. The previous version wrote a canned "lessons" string and
+        # 5/10 scores for every field on any LLM error. Those rows were
+        # indistinguishable in the DB from real analysis, so a dead LLM looked
+        # exactly like a working one — the same failure shape as the phantom
+        # fills and the mock-trading-as-live bug.
+        #
+        # Now: keep the FACTUAL record (derived from the trade itself, always
+        # true), but leave every JUDGEMENT field NULL. Nothing downstream will
+        # mistake a null lesson for a real one — memory.py's prompt builder
+        # skips falsy lessons — and the gap is visible in the journal.
+        llm_failed = False
         try:
             analysis = self._call_llm(trade, similar_list)
         except Exception as e:
-            print(f"  [journal] LLM failed for {trade.symbol}: {e} — using template")
+            llm_failed = True
             outcome = "profitable" if trade.pnl and trade.pnl > 0 else "losing"
+            print("  " + "!" * 60)
+            print(f"  [ALERT] [journal] LLM FAILED for {trade.symbol}: {e}")
+            print("  [ALERT] Recording the factual outcome with NO analysis. "
+                  "Judgement fields left NULL — this is not a real journal entry.")
+            print("  " + "!" * 60)
             analysis = {
                 "what_happened":       f"{trade.symbol} {outcome} trade closed via {trade.exit_reason}",
-                "what_went_right":     "N/A",
-                "what_went_wrong":     "N/A",
-                "lessons":             "Review setup conditions before next entry",
-                "market_conditions":   "Unknown",
-                "entry_quality_score": 5,
-                "exit_quality_score":  5,
-                "plan_adherence_score": 5,
+                "what_went_right":     None,
+                "what_went_wrong":     None,
+                "lessons":             None,
+                "market_conditions":   None,
+                "entry_quality_score": None,
+                "exit_quality_score":  None,
+                "plan_adherence_score": None,
+                "llm_unavailable":     True,
             }
 
         # Generate embedding
@@ -213,14 +231,19 @@ class JournalAgent:
         self.db.commit()
 
         pnl_str = f"{'+'if trade.pnl>=0 else ''}{trade.pnl:.2f}"
-        print(f"  [journal] {trade.symbol} journaled | PnL=${pnl_str} | "
-              f"entry={analysis.get('entry_quality_score')}/10 "
-              f"exit={analysis.get('exit_quality_score')}/10")
+        if llm_failed:
+            print(f"  [journal] {trade.symbol} recorded WITHOUT analysis | PnL=${pnl_str}")
+        else:
+            print(f"  [journal] {trade.symbol} journaled | PnL=${pnl_str} | "
+                  f"entry={analysis.get('entry_quality_score')}/10 "
+                  f"exit={analysis.get('exit_quality_score')}/10")
 
         log_decision(
-            self.db, agent="journal", decision_type="journal",
+            self.db, agent="journal",
+            decision_type="journal_unavailable" if llm_failed else "journal",
             symbol=trade.symbol, trade_id=trade.id,
-            reasoning=analysis.get("lessons"),
+            reasoning=(f"LLM unavailable — no analysis recorded for {trade.symbol}"
+                       if llm_failed else analysis.get("lessons")),
             output=analysis,
         )
 

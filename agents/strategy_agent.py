@@ -58,13 +58,20 @@ opportunities and are not on the avoid list.
 
 def _build_strategy_prompt(briefing: dict, account: dict,
                            similar_trades: list[dict], stats_summary: str = "",
-                           regime: dict = None) -> str:
+                           regime: dict = None, expectancy: dict = None) -> str:
     parts = []
 
     if regime is not None:
         from agents.regime import format_regime_for_prompt
         parts.append(format_regime_for_prompt(regime))
         parts.append("")
+
+    if expectancy is not None:
+        from agents.expectancy_gate import format_expectancy_for_prompt
+        block = format_expectancy_for_prompt(expectancy)
+        if block:
+            parts.append(block)
+            parts.append("")
 
     if briefing.get("alt_signals_text"):
         parts.append(briefing["alt_signals_text"])
@@ -130,11 +137,15 @@ class StrategyAgent:
 
     # ─── Main pipeline ─────────────────────────────────────────────────────────
 
-    def run(self, briefing: dict, regime: dict = None) -> dict:
+    def run(self, briefing: dict, regime: dict = None,
+            expectancy: dict = None) -> dict:
         """
-        1. LLM picks setups (judgment only) — regime context included in prompt
+        1. LLM picks setups (judgment only) — regime + expectancy context in prompt
         2. Pydantic + business rules validate the picks
-        3. Code sizes each trade from live quote + ATR, scaled by regime
+        2b. Picks on SUSPENDED setups are dropped IN CODE — the expectancy gate
+            is authoritative and the LLM cannot argue its way past it
+        3. Code sizes each trade from live quote + ATR, scaled by regime AND by
+           the per-setup expectancy scale
         4. Orders placed, trades recorded as PENDING_FILL
         """
         from execution.sizing import (
@@ -157,7 +168,7 @@ class StrategyAgent:
 
         # 1-2. LLM call + validation
         prompt = _build_strategy_prompt(briefing, account, similar, stats_summary,
-                                        regime=regime)
+                                        regime=regime, expectancy=expectancy)
         raw = self._call_llm(prompt)
         try:
             decision = validate_llm_decision(raw, briefing)
@@ -174,6 +185,35 @@ class StrategyAgent:
             self._log(briefing, result)
             return result
 
+        # 2b. Expectancy gate is enforced HERE, not in the prompt. The LLM is
+        # told which setups are suspended, but being told is not the control —
+        # a pick on a suspended setup is dropped whatever the LLM's reasoning.
+        if expectancy is not None:
+            from agents.expectancy_gate import filter_suspended_picks
+            kept, dropped = filter_suspended_picks(decision.picks, expectancy)
+            if dropped:
+                print(f"  [strategy] expectancy gate dropped {len(dropped)} pick(s): "
+                      + ", ".join(dropped))
+                try:
+                    from db.operations import log_decision
+                    log_decision(self.db, agent="expectancy",
+                                 decision_type="setup_suspended",
+                                 reasoning="dropped picks on suspended setups: "
+                                           + ", ".join(dropped),
+                                 output={"dropped": dropped,
+                                         "suspended": expectancy.get("suspended", [])})
+                except Exception as e:
+                    print(f"  [strategy] could not log expectancy drop: {e}")
+            decision.picks = kept
+
+        if not decision.picks:
+            result = {"trades": [], "executed": [],
+                      "skip_reason": "all picks were on setups suspended by the "
+                                     "expectancy gate",
+                      "decided_at": datetime.utcnow().isoformat()}
+            self._log(briefing, result)
+            return result
+
         # 3. Deterministic sizing from LIVE quotes, scaled by regime
         symbols = [p.symbol for p in decision.picks]
         prices  = get_live_prices(symbols, data_provider=self.data)
@@ -182,10 +222,17 @@ class StrategyAgent:
         base_scale = regime.get("risk_scale", 1.0) if regime else 1.0
         long_scale = regime.get("long_scale", 1.0) if regime else 1.0
 
+        from agents.expectancy_gate import setup_scale as _setup_scale
+
         risk_budget = equity * MAX_SESSION_RISK_PCT * base_scale
         plans = []
         for pick in decision.picks:
-            scale = base_scale * (long_scale if pick.direction == "long" else 1.0)
+            st = getattr(pick, "setup_type", None)
+            st = st.value if hasattr(st, "value") else str(st)
+            exp_scale = _setup_scale(expectancy, st) if expectancy else 1.0
+            scale = (base_scale
+                     * (long_scale if pick.direction == "long" else 1.0)
+                     * exp_scale)
             plan = build_trade_plan(
                 pick,
                 live_price=prices.get(pick.symbol),

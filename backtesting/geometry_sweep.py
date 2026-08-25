@@ -28,7 +28,7 @@ Three safeguards, all mandatory:
    any winner is noise.
 
    BUT A POSITIVE RANK CORRELATION IS NOT EVIDENCE OF EDGE. Measured on
-   structureless synthetic data this sweep still returns rho = +0.61, because
+   structureless synthetic data this sweep returns rho of +0.6 to +0.8, because
    ranking is dominated by a deterministic structural effect: costs are
    charged per side in dollars, so in R terms cost drag scales inversely with
    stop width. Wider stops therefore rank higher in EVERY window, edge or no
@@ -261,8 +261,9 @@ def _judge(winner, rho, eligible) -> tuple:
         base += (f" Fit-vs-validate rank correlation {rho:+.2f}. Note this is "
                  "NOT independent evidence of edge: cost drag scales inversely "
                  "with stop width, so wider stops rank higher in both windows "
-                 "even on structureless data (the synthetic control returns "
-                 "rho = +0.61). Judge on the out-of-sample lower bound, not rho.")
+                 "even on structureless data — the synthetic control returns "
+                 "rho in the +0.6 to +0.8 range with no edge present at all. "
+                 "Judge on the out-of-sample lower bound, not rho.")
 
     fit_exps = [c.fit["expectancy_r"] for c in eligible]
     if fit_exps and max(fit_exps) < 0:

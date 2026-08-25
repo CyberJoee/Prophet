@@ -7,24 +7,92 @@ is computed here from the live quote and ATR. LLMs are unreliable at
 arithmetic and their prices go stale; code is neither.
 
 Risk rules (single source of truth, previously duplicated across prompts):
-  - risk per trade:        2% of equity
+  - risk per trade:        2% of equity   <-- SEE WARNING BELOW, never binds
   - stop distance:         0.5 x ATR(14) from entry
   - target distance:       1.0 x ATR(14) from entry  (2:1 R/R)
-  - max position value:    15% of equity
+  - max position value:    15% of equity  <-- this is what actually sizes
   - max portfolio risk:    6% of equity across all new trades in one session
   - entry sanity:          live quote must exist; qty must be >= 1
+
+WARNING: THE 2% RISK RULE HAS NEVER BEEN IN EFFECT
+--------------------------------------------------
+Two independently sensible rules are in conflict, and the notional cap wins
+every time:
+
+    risk-derived qty = RISK_PER_TRADE_PCT * equity / stop_distance
+    cap-derived qty  = MAX_POSITION_PCT   * equity / price
+
+Setting them equal, the risk rule only binds when
+
+    stop_distance >= price * (RISK_PER_TRADE_PCT / MAX_POSITION_PCT)
+                  =  price * 13.3%
+
+Stops here are 0.5 x ATR(14) on 5-minute intraday bars, typically ~0.4-1.5%
+of price. So the cap binds on essentially every trade and real risk per
+trade is ~0.05-0.2% of equity, not 2%. Verified against live fills:
+
+    SPY  $762.34 -> 20 sh (cap 20.3)    risk taken $66  = 0.064% of equity
+    QQQ  $728.05 -> 21 sh (cap 21.2)
+    MSFT $496.42 -> 31 sh (cap 31.1)
+    NVDA $226.37 -> 68 sh (cap 68.3)
+
+The cap is NOT the bug. Risking 2% with a 0.4% stop implies ~4.6x notional
+leverage (620 SPY shares = $472k against $412k buying power) — the order
+would be rejected. The cap is the only thing preventing the risk rule from
+demanding impossible positions. The 2% figure is simply unreachable given
+this stop geometry.
+
+Consequences to keep in mind:
+  - Do not "fix" this by raising MAX_POSITION_PCT. Sizing is a multiplier on
+    expectancy; scaling up a negative-expectancy system just loses faster.
+    Establish edge first (see the geometry sweep), then revisit.
+  - The expectancy gate's REDUCED tier is currently inert for the same
+    reason: halving risk_dollars moves the risk-derived qty from e.g. 620 to
+    310, still far above a cap of 20, so final size is unchanged. The
+    SUSPENDED tier still works, because it drops the pick before sizing.
+  - At small equity the cap collapses to a handful of shares and integer
+    truncation dominates: at $10k, SPY sizes to 1 share ($3.32 risk) and
+    QQQ to 2. Below roughly $10k, high-priced symbols round to qty 0 and are
+    skipped entirely. See size_report() for a quick check at any equity.
 """
 from typing import Literal, Optional
 from pydantic import BaseModel, Field, field_validator
 
 # ─── Risk configuration ───────────────────────────────────────────────────────
 
+# NOTE: RISK_PER_TRADE_PCT is aspirational, not operative — MAX_POSITION_PCT
+# binds first on every realistic intraday stop. See the module docstring.
 RISK_PER_TRADE_PCT   = 0.02
-STOP_ATR_MULT        = 0.5
-TARGET_ATR_MULT      = 1.0
-MAX_POSITION_PCT     = 0.15
+STOP_ATR_MULT        = 0.5      # geometry under test — see backtesting/geometry_sweep.py
+TARGET_ATR_MULT      = 1.0      # only ~7% of live trades ever reach this
+MAX_POSITION_PCT     = 0.15     # the rule that actually determines position size
 MAX_SESSION_RISK_PCT = 0.06
 MIN_CONVICTION       = 0.60
+
+
+def size_report(equity: float, price: float, atr: float,
+                stop_mult: float = None) -> dict:
+    """
+    What would sizing do at this equity/price/ATR? Pure arithmetic, no order.
+
+    Exists because the interaction between the risk rule and the notional cap
+    is not obvious by inspection, and gets worse as equity shrinks — which
+    matters if the account is ever run down to ~$10k.
+    """
+    stop_mult = STOP_ATR_MULT if stop_mult is None else stop_mult
+    stop_dist = stop_mult * atr
+    risk_qty  = int(equity * RISK_PER_TRADE_PCT / stop_dist) if stop_dist else 0
+    cap_qty   = int(equity * MAX_POSITION_PCT / price) if price else 0
+    qty       = max(0, min(risk_qty, cap_qty))
+    return {
+        "equity": equity, "price": price, "stop_distance": round(stop_dist, 4),
+        "risk_qty": risk_qty, "cap_qty": cap_qty, "qty": qty,
+        "bound_by": ("none — qty 0, trade skipped" if qty < 1
+                     else "notional-cap" if cap_qty <= risk_qty else "risk-rule"),
+        "dollar_risk": round(qty * stop_dist, 2),
+        "risk_pct_of_equity": round(qty * stop_dist / equity, 5) if equity else 0,
+        "notional": round(qty * price, 2),
+    }
 
 
 # ─── LLM output schema (validated, never trusted raw) ─────────────────────────
@@ -109,13 +177,25 @@ class TradePlan(BaseModel):
 
 def build_trade_plan(pick: LLMPick, live_price: float, atr: float,
                      equity: float, risk_budget_left: float,
-                     risk_scale: float = 1.0) -> Optional[TradePlan]:
+                     risk_scale: float = 1.0,
+                     stop_mult: float = None,
+                     target_mult: float = None,
+                     verbose: bool = True) -> Optional[TradePlan]:
     """
     Turn a validated LLM pick into an executable plan using the LIVE quote.
     risk_scale (0-1) comes from the regime gate — scales dollar risk down
     in hostile conditions. 0 means no trade.
+
+    stop_mult / target_mult override the module ATR multiples. They exist so
+    the geometry sweep can test alternative stop/target pairs through THIS
+    code path rather than a reimplementation — the same discipline that made
+    engine_v2 trustworthy. Both default to the live constants, so omitting
+    them reproduces production behaviour exactly.
+
     Returns None (with a printed reason) if the trade can't be sized sanely.
     """
+    stop_mult   = STOP_ATR_MULT   if stop_mult   is None else stop_mult
+    target_mult = TARGET_ATR_MULT if target_mult is None else target_mult
     if risk_scale <= 0:
         print(f"  [sizing] {pick.symbol}: risk_scale is 0 (regime gate) — skipping")
         return None
@@ -130,14 +210,14 @@ def build_trade_plan(pick: LLMPick, live_price: float, atr: float,
         return None
 
     is_long   = pick.direction == "long"
-    stop_dist = STOP_ATR_MULT * atr
+    stop_dist = stop_mult * atr
 
     if is_long:
         stop   = round(live_price - stop_dist, 2)
-        target = round(live_price + TARGET_ATR_MULT * atr, 2)
+        target = round(live_price + target_mult * atr, 2)
     else:
         stop   = round(live_price + stop_dist, 2)
-        target = round(live_price - TARGET_ATR_MULT * atr, 2)
+        target = round(live_price - target_mult * atr, 2)
 
     # Sanity: stop must be on the correct side and non-degenerate
     if stop_dist < live_price * 0.001:
@@ -152,11 +232,21 @@ def build_trade_plan(pick: LLMPick, live_price: float, atr: float,
     # Position size: 2% risk scaled by regime, capped by 15% of equity
     # and remaining session budget
     risk_dollars = min(equity * RISK_PER_TRADE_PCT * risk_scale, risk_budget_left)
-    qty = int(risk_dollars / stop_dist)
-    qty = min(qty, int((equity * MAX_POSITION_PCT) / live_price))
+    risk_qty = int(risk_dollars / stop_dist)
+    cap_qty  = int((equity * MAX_POSITION_PCT) / live_price)
+    qty = min(risk_qty, cap_qty)
     if qty < 1:
-        print(f"  [sizing] {pick.symbol}: qty < 1 after caps — skipping")
+        print(f"  [sizing] {pick.symbol}: qty < 1 after caps "
+              f"(risk-qty {risk_qty}, cap-qty {cap_qty}) — skipping")
         return None
+
+    # Name the binding constraint. This is the line whose absence let a dead
+    # 2% risk rule sit in the code unnoticed for the life of the project.
+    if verbose:
+        bound_by = "notional-cap" if cap_qty <= risk_qty else "risk-rule"
+        print(f"  [sizing] {pick.symbol}: qty {qty} bound by {bound_by} "
+              f"(risk-qty {risk_qty}, cap-qty {cap_qty}); "
+              f"risk ${qty * stop_dist:,.2f} = {qty * stop_dist / equity:.3%} of equity")
 
     dollar_risk = round(qty * stop_dist, 2)
     reward      = abs(target - live_price)

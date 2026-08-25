@@ -79,6 +79,20 @@ class BacktestConfig:
     use_regime_gate: bool = False
     setups: tuple = ("orb", "vwap_bounce", "momentum")
 
+    # ── Geometry under test ──
+    # None means "use the live constants in execution/sizing.py", so a default
+    # BacktestConfig reproduces production exactly. The sweep varies these.
+    stop_mult: float = None            # x ATR(14) from entry
+    target_mult: float = None          # x ATR(14) from entry
+    time_exit_minutes: int = None      # flat after N minutes in the position
+
+    def label(self) -> str:
+        from execution.sizing import STOP_ATR_MULT, TARGET_ATR_MULT
+        sm = STOP_ATR_MULT if self.stop_mult is None else self.stop_mult
+        tm = TARGET_ATR_MULT if self.target_mult is None else self.target_mult
+        te = "eod" if self.time_exit_minutes is None else f"{self.time_exit_minutes}m"
+        return f"stop{sm:g}/target{tm:g}/exit-{te}"
+
 
 # ─── Setup detectors (mechanical versions of the live setup taxonomy) ─────────
 
@@ -264,6 +278,9 @@ class BacktestEngineV2:
                             equity=self.equity,
                             risk_budget_left=risk_budget,
                             risk_scale=scale,
+                            stop_mult=self.cfg.stop_mult,
+                            target_mult=self.cfg.target_mult,
+                            verbose=False,
                         )
                         if plan is None:
                             continue
@@ -309,6 +326,10 @@ class BacktestEngineV2:
             return
 
         # 2. Bracket simulation bar by bar after fill
+        time_exit_at = None
+        if self.cfg.time_exit_minutes:
+            time_exit_at = t.fill_time + timedelta(minutes=self.cfg.time_exit_minutes)
+
         for b in sbars:
             if b["timestamp"] <= t.fill_time:
                 continue
@@ -325,6 +346,11 @@ class BacktestEngineV2:
                 return
             if hit_target:
                 self._close(t, t.target, b["timestamp"], "target_hit")
+                return
+            # Time exit is checked LAST within the bar: an intrabar stop or
+            # target would have triggered before the clock ran out.
+            if time_exit_at is not None and b["timestamp"] >= time_exit_at:
+                self._close(t, b["close"], b["timestamp"], "time_exit")
                 return
 
         # 3. EOD close at the last bar before 15:55
@@ -381,7 +407,36 @@ class BacktestEngineV2:
                 "stop_hits": sum(1 for t in ts if t.exit_reason == "stop_hit"),
                 "target_hits": sum(1 for t in ts if t.exit_reason == "target_hit"),
                 "eod_closes": sum(1 for t in ts if t.exit_reason == "eod_close"),
+                "time_exits": sum(1 for t in ts if t.exit_reason == "time_exit"),
             }
+
+        # Aggregate across setups. The sweep ranks on this, so it lives here
+        # rather than being recomputed by every caller.
+        if filled:
+            rs = [t.r_multiple for t in filled]
+            wins = [t for t in filled if t.pnl > 0]
+            gp = sum(t.pnl for t in wins)
+            gl = abs(sum(t.pnl for t in filled if t.pnl <= 0))
+            rep["overall"] = {
+                "trades": len(filled),
+                "expectancy_r": round(statistics.mean(rs), 4),
+                "stdev_r": round(statistics.stdev(rs), 4) if len(rs) > 1 else 0.0,
+                "stderr_r": round(
+                    (statistics.stdev(rs) / math.sqrt(len(rs))) if len(rs) > 1 else 0.0, 4),
+                "win_rate": round(len(wins) / len(filled), 3),
+                "profit_factor": round(gp / gl, 2) if gl else float("inf"),
+                "total_pnl": round(sum(t.pnl for t in filled), 2),
+                "exits": {
+                    "stop_hit":   sum(1 for t in filled if t.exit_reason == "stop_hit"),
+                    "target_hit": sum(1 for t in filled if t.exit_reason == "target_hit"),
+                    "eod_close":  sum(1 for t in filled if t.exit_reason == "eod_close"),
+                    "time_exit":  sum(1 for t in filled if t.exit_reason == "time_exit"),
+                },
+            }
+        else:
+            rep["overall"] = {"trades": 0, "expectancy_r": None, "stdev_r": None,
+                              "stderr_r": None, "win_rate": None,
+                              "profit_factor": None, "total_pnl": 0.0, "exits": {}}
 
         monthly = defaultdict(float)
         for t in filled:

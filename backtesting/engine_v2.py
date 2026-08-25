@@ -166,28 +166,49 @@ class BacktestEngineV2:
         self.trades: list[SimTrade] = []
         self.daily_equity: list[tuple] = []   # (date, equity)
 
+        # Index bars by (symbol, session date) ONCE.
+        #
+        # _session_bars used to linear-scan the whole bar list on every call,
+        # and _atr14 calls it ~15x per symbol per day. On a year of 5-min bars
+        # that is ~112M comparisons per backtest — tolerable for a single run,
+        # ruinous for the geometry sweep, which runs ~96 of them.
+        self._day_index: dict = {}
+        for sym, bars in bars_by_symbol.items():
+            byday = defaultdict(list)
+            for b in bars:
+                ts = b["timestamp"]
+                if OPEN_TIME <= ts.time() <= dtime(16, 0):
+                    byday[ts.date()].append(b)
+            self._day_index[sym] = dict(byday)
+        self._agg_cache: dict = {}
+        self._sessions_cache: Optional[list] = None
+
     # ── Session helpers ──
 
     def _sessions(self) -> list:
         """All trading dates present in the data, sorted."""
-        dates = set()
-        for bars in self.bars.values():
-            for b in bars:
-                dates.add(b["timestamp"].date())
-        return sorted(dates)
+        if self._sessions_cache is None:
+            dates = set()
+            for byday in self._day_index.values():
+                dates.update(byday.keys())
+            self._sessions_cache = sorted(dates)
+        return self._sessions_cache
 
     def _session_bars(self, symbol: str, day) -> list[dict]:
-        return [b for b in self.bars.get(symbol, [])
-                if b["timestamp"].date() == day
-                and OPEN_TIME <= b["timestamp"].time() <= dtime(16, 0)]
+        """O(1) lookup against the index built in __init__."""
+        return self._day_index.get(symbol, {}).get(day, [])
 
     def _daily_agg(self, symbol: str, day) -> Optional[dict]:
+        key = (symbol, day)
+        if key in self._agg_cache:
+            return self._agg_cache[key]
         bars = self._session_bars(symbol, day)
-        if not bars:
-            return None
-        return {"open": bars[0]["open"], "close": bars[-1]["close"],
-                "high": max(b["high"] for b in bars),
-                "low": min(b["low"] for b in bars)}
+        agg = None if not bars else {
+            "open": bars[0]["open"], "close": bars[-1]["close"],
+            "high": max(b["high"] for b in bars),
+            "low": min(b["low"] for b in bars)}
+        self._agg_cache[key] = agg
+        return agg
 
     def _atr14(self, symbol: str, day, sessions: list) -> Optional[float]:
         """Daily ATR(14) computed from 5-min data aggregated per session."""
@@ -243,13 +264,13 @@ class BacktestEngineV2:
         sessions = self._sessions()
         symbols = [s for s in self.bars.keys() if s != "SPY"]
 
-        for day in sessions[16:]:   # need ATR warmup
+        for day_i, day in enumerate(sessions[16:], start=16):
             regime = self._regime_for_day(day, sessions)
             day_trades: list[SimTrade] = []
 
             if regime["trade_allowed"]:
                 risk_budget = self.equity * MAX_SESSION_RISK_PCT * regime["risk_scale"]
-                prev_idx = sessions.index(day) - 1
+                prev_idx = day_i - 1
 
                 for symbol in symbols:
                     if len(day_trades) >= MAX_CONCURRENT:

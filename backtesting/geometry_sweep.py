@@ -47,6 +47,7 @@ covers zero.
 """
 import math
 import statistics
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -144,7 +145,8 @@ def run_sweep(bars_by_symbol: dict,
               time_exits=DEFAULT_TIME_EXITS,
               fit_frac: float = 0.6,
               min_trades: int = 30,
-              base: BacktestConfig = None) -> dict:
+              base: BacktestConfig = None,
+              progress: bool = True) -> dict:
     """
     Run the grid over fit and validate windows.
 
@@ -155,15 +157,32 @@ def run_sweep(bars_by_symbol: dict,
     base = base or BacktestConfig()
     fit_bars, val_bars, fit_days, val_days = _split_sessions(bars_by_symbol, fit_frac)
 
+    combos = [(sm, tm, te) for sm in stops for tm in targets for te in time_exits]
+    total = len(combos)
+    if progress:
+        print(f"Sweeping {total} cells "
+              f"({len(fit_days)} fit / {len(val_days)} validate sessions)...",
+              flush=True)
+
     cells: list[CellResult] = []
-    for sm in stops:
-        for tm in targets:
-            for te in time_exits:
-                cells.append(CellResult(
-                    stop_mult=sm, target_mult=tm, time_exit=te,
-                    fit=_run_cell(fit_bars, sm, tm, te, base),
-                    validate=_run_cell(val_bars, sm, tm, te, base),
-                ))
+    t_start = time.time()
+    for i, (sm, tm, te) in enumerate(combos, start=1):
+        cell = CellResult(
+            stop_mult=sm, target_mult=tm, time_exit=te,
+            fit=_run_cell(fit_bars, sm, tm, te, base),
+            validate=_run_cell(val_bars, sm, tm, te, base),
+        )
+        cells.append(cell)
+        if progress:
+            elapsed = time.time() - t_start
+            eta = elapsed / i * (total - i)
+            fx = cell.fit.get("expectancy_r")
+            vx = cell.validate.get("expectancy_r")
+            print(f"  [{i:3d}/{total}] {cell.label:22s} "
+                  f"fit={fx:+.3f}R " if fx is not None else
+                  f"  [{i:3d}/{total}] {cell.label:22s} fit=  n/a  ", end="")
+            print(f"val={vx:+.3f}R " if vx is not None else "val=  n/a  ", end="")
+            print(f"| {elapsed:5.0f}s elapsed, ~{eta:.0f}s left", flush=True)
 
     eligible = [c for c in cells
                 if (c.fit.get("trades") or 0) >= min_trades

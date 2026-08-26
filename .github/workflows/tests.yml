@@ -1,0 +1,43 @@
+name: tests
+
+# Runs on every PR, and on direct pushes to main as a backstop until branch
+# protection makes those impossible.
+#
+# Why this exists: pushing to main auto-deploys BOTH Railway services, one of
+# which is a live trading loop. Before this workflow the only thing running
+# the test suite was someone remembering to.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Deliberately NOT `pip install -r requirements.txt`.
+      #
+      # The suite is built to be self-contained — in-memory SQLite with
+      # @compiles shims for the Postgres-only column types, and stubbed
+      # alpaca/groq modules — so it needs none of the runtime stack. Installing
+      # the full manifest would pull pandas/pandas-ta, which are slow and
+      # historically fragile across numpy releases, and a flaky CI is a CI
+      # everyone learns to ignore.
+      #
+      # A broken requirements.txt still surfaces immediately, because Railway
+      # fails the build on deploy.
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "sqlalchemy>=2.0" "pgvector>=0.2" "python-dotenv>=1.0" "pydantic>=2.0"
+
+      - name: Run test suite
+        run: python scripts/run_tests.py

@@ -100,7 +100,12 @@ class JournalAgent:
         from agents.llm_client import DEFAULT_MODEL
         response = client.chat.completions.create(
             model=os.getenv("GROQ_MODEL", DEFAULT_MODEL),
-            max_tokens=800,
+            # Raised from 800 for the same reason as llm_client's budget:
+            # gpt-oss-120b spends tokens on reasoning before emitting JSON, so
+            # a tight budget truncates the output mid-string. This path still
+            # lacks call_llm's retry and error classification — it should be
+            # migrated onto call_llm rather than duplicating the Groq call.
+            max_tokens=int(os.getenv("JOURNAL_MAX_TOKENS", "2000")),
             temperature=0.3,
             messages=[
                 {"role": "system", "content": JOURNAL_SYSTEM_PROMPT},

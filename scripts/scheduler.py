@@ -109,6 +109,7 @@ def morning_pipeline():
         research = ResearchAgent(data_provider=dp, db_session=db)
         briefing = None
         llm_broken = False
+        llm_error = None
         if is_llm_available():
             try:
                 briefing = research.run()
@@ -128,14 +129,18 @@ def morning_pipeline():
                       "to mock decisions in production.")
                 print("  " + "!" * 60)
                 from db.operations import log_decision
+                llm_error = e
                 log_decision(db, agent="research", decision_type="llm_unavailable",
-                             reasoning=f"LLM call failed: {e}")
+                             reasoning=f"{type(e).__name__}: {e}")
         if briefing is None and not llm_broken:
             briefing = research.run_mock()
             print(f"  [MOCK] mood={briefing['market_mood']} (LLM not configured)")
         if llm_broken:
-            print("Morning pipeline aborted — fix GROQ_MODEL / API key and "
-                  "the scheduled run will pick back up tomorrow.")
+            print(f"Morning pipeline aborted ({type(llm_error).__name__}). "
+                  "The scheduled run picks back up tomorrow. "
+                  "LLMTruncated -> raise LLM_MAX_TOKENS; "
+                  "LLMBadJSON -> prompt/model problem; "
+                  "anything else -> check GROQ_MODEL / GROQ_API_KEY / rate limits.")
             return
 
         # Earnings guard — drop opportunities reporting within 2 days
@@ -174,9 +179,12 @@ def morning_pipeline():
                 print("  " + "!" * 60)
                 from db.operations import log_decision
                 log_decision(db, agent="strategy", decision_type="llm_unavailable",
-                             reasoning=f"LLM call failed: {e}")
-                print("Morning pipeline aborted after research succeeded but "
-                      "strategy failed — check GROQ_MODEL / rate limits.")
+                             reasoning=f"{type(e).__name__}: {e}")
+                print(f"Morning pipeline aborted after research succeeded but "
+                      f"strategy failed ({type(e).__name__}). "
+                      "LLMTruncated -> raise LLM_MAX_TOKENS; "
+                      "LLMBadJSON -> prompt/model problem; "
+                      "anything else -> check GROQ_MODEL / rate limits.")
                 return
         else:
             decision = strategy.run_mock(briefing)

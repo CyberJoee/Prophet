@@ -18,6 +18,73 @@ from typing import Optional
 
 BASELINE_DAYS = 20
 
+# ── Measurement universe ─────────────────────────────────────────────────────
+#
+# Signals are COLLECTED on a wide universe but BRIEFED on the trading
+# watchlist only. Those are different jobs and were previously conflated.
+#
+# Why wider: eval_signals measures a cross-sectional IC — symbols ranked
+# against each other within a date. The noise on that per-date estimate is
+# ~1/sqrt(n-1) in the number of names, so the standard error of the mean IC
+# falls with BOTH more dates and more names. The first real evaluation
+# (2026-08-26, 37 dates x 10 names) had se ~0.055, meaning it could only
+# resolve |IC| >= 0.11 — far above the 0.02-0.05 that real alt-signals carry.
+# Going from 10 names to ~40 cuts the standard error roughly in half, worth
+# about a 4x speedup in calendar time to a usable answer.
+#
+# Why NOT wider in the briefing: the LLM prompt is a scarce resource. On
+# 2026-08-26 the research call was truncated mid-JSON because the output
+# exceeded its token budget. Pouring 40 symbols of options-flow prose into
+# the prompt would make that worse and buy nothing — the LLM can only trade
+# the watchlist anyway.
+#
+# Collection is free: FINRA short volume arrives in one file covering every
+# symbol, and options flow is one yfinance call per name that fails open
+# independently.
+DEFAULT_SIGNAL_UNIVERSE = [
+    # megacap tech / the current trading watchlist
+    "NVDA", "AAPL", "TSLA", "MSFT", "AMZN", "META", "GOOGL", "JPM", "SPY", "QQQ",
+    # semis + hardware
+    "AMD", "AVGO", "MU", "INTC", "QCOM", "TSM",
+    # software / internet
+    "CRM", "ORCL", "ADBE", "NFLX", "UBER", "PLTR",
+    # financials
+    "BAC", "GS", "WFC", "V", "MA", "C",
+    # healthcare / staples
+    "UNH", "JNJ", "PFE", "LLY", "WMT", "COST", "PG", "KO",
+    # industrials / energy
+    "BA", "CAT", "GE", "XOM", "CVX",
+    # broad ETFs (index-level readings, and a sanity check on the collectors)
+    "IWM", "DIA", "XLF", "XLE", "XLK",
+]
+
+MAX_UNIVERSE = 80        # guard against a runaway env var
+
+
+def get_signal_universe(watchlist: list[str] = None) -> list[str]:
+    """
+    Symbols to COLLECT signals on. Always a superset of the watchlist.
+
+    Override with SIGNAL_UNIVERSE (comma-separated). Set it to the watchlist
+    to restore the old narrow behaviour. Order is preserved and duplicates
+    are dropped so the trading names come first.
+    """
+    import os
+    raw = os.getenv("SIGNAL_UNIVERSE", "")
+    configured = ([s.strip().upper() for s in raw.split(",") if s.strip()]
+                  if raw.strip() else list(DEFAULT_SIGNAL_UNIVERSE))
+    combined = [s.upper() for s in (watchlist or [])] + configured
+    seen, out = set(), []
+    for sym in combined:
+        if sym and sym not in seen:
+            seen.add(sym)
+            out.append(sym)
+    if len(out) > MAX_UNIVERSE:
+        print(f"  [alt] SIGNAL_UNIVERSE has {len(out)} symbols — "
+              f"truncating to {MAX_UNIVERSE}")
+        out = out[:MAX_UNIVERSE]
+    return out
+
 
 def _store(db, signal_date, symbol: str, source: str, metrics: dict):
     from db.models import AltSignal
@@ -46,14 +113,21 @@ def _baseline(db, symbol: str, source: str, keys: list[str]) -> Optional[dict]:
     return out or None
 
 
-def collect_all(db, symbols: list[str]) -> dict:
+def collect_all(db, symbols: list[str], universe: list[str] = None) -> dict:
     """
     Run every collector, store snapshots, return:
       {
-        "text": <briefing block for the LLM>,
+        "text": <briefing block for the LLM — WATCHLIST ONLY>,
         "event_scale": 1.0 | 0.5,       # enforced by scheduler in code
-        "per_symbol": {sym: {...}},
+        "per_symbol": {sym: {...}},     # watchlist only
+        "collected": int,               # symbols actually stored
       }
+
+    `symbols`  — the trading watchlist. Drives the LLM briefing.
+    `universe` — the wider set to collect and STORE for later measurement.
+                 Defaults to get_signal_universe(symbols). Everything here is
+                 written to alt_signals; only `symbols` reaches the prompt.
+
     Never raises — each collector fails open independently.
     """
     from data.alt_signals import options_flow, short_volume, event_risk
@@ -62,6 +136,11 @@ def collect_all(db, symbols: list[str]) -> dict:
     lines = []
     per_symbol: dict = {}
     event_scale = 1.0
+
+    if universe is None:
+        universe = get_signal_universe(symbols)
+    briefed = {s.upper() for s in symbols}      # only these reach the prompt
+    collected = 0
 
     # ── Macro event risk (market-wide) ──
     try:
@@ -80,9 +159,13 @@ def collect_all(db, symbols: list[str]) -> dict:
     # ── Short volume (one fetch covers all symbols) ──
     sv_lines = []
     try:
-        sv = short_volume.collect_short_volume(symbols)
+        # One FINRA file covers every symbol, so the wide universe is free here.
+        sv = short_volume.collect_short_volume(universe)
         for sym, m in sv.items():
             _store(db, today, sym, "short_volume", m)
+            collected += 1
+            if sym.upper() not in briefed:
+                continue                     # stored for measurement, not briefed
             per_symbol.setdefault(sym, {})["short_volume"] = m
             base = _baseline(db, sym, "short_volume", ["short_volume_ratio"])
             desc = short_volume.describe(sym, m, base)
@@ -96,12 +179,15 @@ def collect_all(db, symbols: list[str]) -> dict:
 
     # ── Options flow (per symbol) ──
     of_lines = []
-    for sym in symbols:
+    for sym in universe:
         try:
             m = options_flow.collect_options_flow(sym)
             if m is None:
                 continue
             _store(db, today, sym, "options_flow", m)
+            collected += 1
+            if sym.upper() not in briefed:
+                continue                     # stored for measurement, not briefed
             per_symbol.setdefault(sym, {})["options_flow"] = m
             base = _baseline(db, sym, "options_flow",
                              ["atm_iv", "total_opt_volume"])
@@ -125,4 +211,8 @@ def collect_all(db, symbols: list[str]) -> dict:
         text = ("ALTERNATIVE DATA SIGNALS (differentiated inputs — factor "
                 "these into setup selection):\n" + "\n".join(lines))
 
-    return {"text": text, "event_scale": event_scale, "per_symbol": per_symbol}
+    print(f"  [alt] stored {collected} snapshot(s) across {len(universe)} "
+          f"symbol(s); briefed {len(briefed)}")
+
+    return {"text": text, "event_scale": event_scale,
+            "per_symbol": per_symbol, "collected": collected}

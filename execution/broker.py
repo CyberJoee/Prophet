@@ -156,11 +156,24 @@ class MockExecutionClient(ExecutionClient):
         return count
 
     def close_position(self, symbol: str) -> dict:
+        """Mock fills are instant. Shape matches the Alpaca client so the
+        confirmation path in position_monitor is identical for both."""
         pos = self._positions.get(symbol)
         if not pos:
-            return {"error": f"No position in {symbol}"}
+            return {"id": None, "symbol": symbol, "status": "failed",
+                    "filled_qty": 0.0, "filled_avg_price": None,
+                    "error": f"No position in {symbol}"}
         price = self._get_price(symbol)
-        return self._fill_order(str(uuid.uuid4()), symbol, pos["qty"], "sell", price)
+        order = self._fill_order(str(uuid.uuid4()), symbol, pos["qty"], "sell", price)
+        return {
+            "id":               order["id"],
+            "symbol":           symbol,
+            "status":           order["status"],
+            "filled_qty":       order["qty"],
+            "filled_avg_price": order["fill_price"],
+            "filled_at":        order["filled_at"],
+            "legs":             [],
+        }
 
     def get_position(self, symbol: str) -> Optional[dict]:
         pos = self._positions.get(symbol)
@@ -326,8 +339,28 @@ class AlpacaExecutionClient(ExecutionClient):
             return False
 
     def close_position(self, symbol: str) -> dict:
-        result = self.client.close_position(symbol)
-        return {"symbol": symbol, "status": "closed"}
+        """
+        Submit a close and return the resulting ORDER, not a success sentinel.
+
+        This used to return {"status": "closed"} unconditionally, discarding
+        the order Alpaca hands back. Callers therefore had no way to check
+        whether the close actually filled, and position_monitor marked trades
+        CLOSED on the strength of that sentinel. On 2026-08-24 a close
+        submitted after the bell never filled and a 20-share SPY short was
+        carried overnight while the database showed flat.
+
+        The order id is what makes confirmation possible.
+        """
+        try:
+            order = self.client.close_position(symbol)
+            d = self._order_to_dict(order)
+            d["symbol"] = symbol
+            return d
+        except Exception as e:
+            print(f"  [broker] close_position({symbol}) failed: {e}")
+            return {"id": None, "symbol": symbol, "status": "failed",
+                    "filled_qty": 0.0, "filled_avg_price": None,
+                    "error": str(e)}
 
     def get_position(self, symbol: str) -> Optional[dict]:
         try:

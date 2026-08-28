@@ -285,7 +285,12 @@ scheduler.add_job(
 # 4:15 PM ET — end of day, Mon-Fri
 scheduler.add_job(
     end_of_day,
-    CronTrigger(day_of_week="mon-fri", hour=16, minute=15, timezone=ET),
+    # 15:50, NOT 16:15. End of day cancels the bracket legs and then submits a
+    # close; at 16:15 the market is shut, so that close could not fill and the
+    # position was carried overnight unprotected while the DB showed flat
+    # (observed 2026-08-24). Ten minutes before the bell leaves room to fill
+    # and to retry.
+    CronTrigger(day_of_week="mon-fri", hour=15, minute=50, timezone=ET),
     id="end_of_day",
     name="End of Day Close",
     misfire_grace_time=300,
@@ -328,6 +333,19 @@ if __name__ == "__main__":
         from db.connection import SessionLocal as _SL
         _db = _SL()
         sync_alpaca_to_db(_db)
+
+        # Does the DB agree with the broker? Six weeks of untracked positions
+        # went unnoticed because nothing ever asked. Startup is the cheapest
+        # place to ask, and a restart is exactly when a stale position from
+        # the previous session would surface.
+        try:
+            from execution.reconciliation import reconcile, log_reconciliation
+            from execution.broker import get_execution_client
+            _res = reconcile(_db, get_execution_client(), context="startup")
+            log_reconciliation(_db, _res, context="startup")
+        except Exception as e:
+            print(f"  [reconcile] startup check failed: {e}")
+
         _db.close()
     except Exception as e:
         print(f"  [sync] Startup sync failed: {e}")

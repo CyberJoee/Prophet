@@ -42,7 +42,8 @@ def confirm_fills(db, broker) -> dict:
     Returns counts of what happened.
     """
     from db.operations import (
-        get_pending_trades, confirm_trade_fill, cancel_pending_trade, log_decision
+        get_pending_trades, confirm_trade_fill, cancel_pending_trade, log_decision,
+        update_trade_quantity
     )
 
     result = {"confirmed": 0, "cancelled": 0, "still_pending": 0}
@@ -68,7 +69,22 @@ def confirm_fills(db, broker) -> dict:
         filled_qty = float(order.get("filled_qty") or 0)
         fill_price = order.get("filled_avg_price")
 
-        if status == "filled" or (filled_qty > 0 and fill_price):
+        # A PARTIAL fill is not a fill. Promoting on `filled_qty > 0` moved the
+        # trade out of PENDING_FILL, so the tracker never looked at it again and
+        # the still-working remainder became invisible: the DB would say 15
+        # shares while the broker went on to hold 20. A partial now stays
+        # pending, with its quantity kept current, and is re-checked next cycle.
+        if status != "filled" and filled_qty > 0 and fill_price:
+            try:
+                update_trade_quantity(db, trade.id, filled_qty)
+            except Exception as e:
+                print(f"  [tracker] could not update {trade.symbol} quantity: {e}")
+            print(f"  [tracker] {trade.symbol} PARTIAL fill {filled_qty:.0f} "
+                  f"(status={status}) — staying pending, remainder still working")
+            result["still_pending"] += 1
+            continue
+
+        if status == "filled":
             confirmed = confirm_trade_fill(
                 db, trade.id,
                 fill_price=float(fill_price),

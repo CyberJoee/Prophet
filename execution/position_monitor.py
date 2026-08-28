@@ -41,6 +41,11 @@ class PositionMonitor:
         self.broker  = execution_client
         self.db      = db_session
         self._snapshot_counter = 0
+        # How hard to chase confirmation that an EOD close actually filled.
+        # Configurable so tests need not sleep, and so a slow-filling day can
+        # be given more room without a deploy.
+        self._close_attempts = int(os.getenv("EOD_CLOSE_ATTEMPTS", "5"))
+        self._close_delay    = float(os.getenv("EOD_CLOSE_DELAY_S", "2"))
 
     # ─── Main entry point ─────────────────────────────────────────────────────
 
@@ -289,23 +294,108 @@ class PositionMonitor:
                               f"@ ${exit_price:.2f} | PnL: ${closed.pnl:+.2f}")
                         continue
 
-                exit_price = prices.get(trade.symbol) or trade.entry_price
-                self.broker.close_position(trade.symbol)
+                order = self.broker.close_position(trade.symbol)
+                fill_price = self._confirm_close(trade, order)
+
+                if fill_price is None:
+                    # DO NOT mark this closed. The position is still live at
+                    # the broker with its bracket legs already cancelled.
+                    # Recording it as closed here is exactly how a 20-share
+                    # SPY short was carried overnight on 2026-08-24 while the
+                    # database showed flat.
+                    print("  " + "!" * 60)
+                    print(f"  [ALERT] [monitor] {trade.symbol} CLOSE NOT CONFIRMED "
+                          f"— leaving trade OPEN")
+                    print(f"  [ALERT] The position may still be live at the broker. "
+                          f"Check Alpaca and close by hand.")
+                    print("  " + "!" * 60)
+                    log_decision(
+                        self.db, agent="monitor",
+                        decision_type="eod_close_unconfirmed",
+                        symbol=trade.symbol, trade_id=trade.id,
+                        reasoning=("close submitted but no fill confirmed; trade "
+                                   "left OPEN rather than recorded as closed"),
+                        output={"order": order},
+                    )
+                    continue
+
                 closed = close_trade(self.db, trade.id,
-                                     exit_price=exit_price, exit_reason="eod_close")
-                print(f"  [monitor] EOD closed {trade.symbol} @ ${exit_price:.2f} | "
-                      f"PnL: ${closed.pnl:+.2f}")
+                                     exit_price=fill_price, exit_reason="eod_close")
+                print(f"  [monitor] EOD closed {trade.symbol} @ ${fill_price:.2f} "
+                      f"(confirmed fill) | PnL: ${closed.pnl:+.2f}")
                 log_decision(
                     self.db, agent="monitor", decision_type="eod_close",
                     symbol=trade.symbol, trade_id=trade.id,
                     reasoning="End of day — closing all positions before market close",
-                    output={"exit_price": exit_price, "pnl": closed.pnl},
+                    output={"exit_price": fill_price, "pnl": closed.pnl,
+                            "confirmed": True},
                 )
             except Exception as e:
                 print(f"  [monitor] EOD close failed for {trade.symbol}: {e}")
 
         self._save_snapshot()
         self._refresh_stats()
+
+        # Standing check that we actually ended the day flat. The individual
+        # bugs that caused untracked positions are fixed; this catches the
+        # next one.
+        try:
+            from execution.reconciliation import reconcile, log_reconciliation
+            result = reconcile(self.db, self.broker, context="after EOD close")
+            log_reconciliation(self.db, result, context="after EOD close")
+        except Exception as e:
+            print(f"  [monitor] reconciliation check failed: {e}")
+
+    def _confirm_close(self, trade, order, attempts: int = None,
+                       delay: float = None):
+        """
+        Return the real fill price of a close, or None if it never confirmed.
+
+        The previous code recorded the LIVE QUOTE as the exit price without
+        checking anything. Measured against actual session closes that was off
+        by 0.49% on average — comparable to a whole risk unit, since stops sit
+        at 0.5x ATR. Every R the expectancy gate computes rests on these
+        numbers, so they need to be fills rather than guesses.
+        """
+        import time
+        attempts = self._close_attempts if attempts is None else attempts
+        delay    = self._close_delay if delay is None else delay
+
+        def _fill_of(o):
+            if not isinstance(o, dict):
+                return None
+            status = str(o.get("status", "")).lower()
+            price = o.get("filled_avg_price")
+            qty = float(o.get("filled_qty") or 0)
+            if price and qty > 0 and ("filled" in status or status == "closed"):
+                return float(price)
+            return None
+
+        price = _fill_of(order)
+        if price is not None:
+            return price
+
+        order_id = (order or {}).get("id")
+        if not order_id:
+            return None
+
+        for i in range(attempts):
+            time.sleep(delay)
+            try:
+                fresh = self.broker.get_order(order_id)
+            except Exception as e:
+                print(f"  [monitor] close lookup failed for {trade.symbol}: {e}")
+                return None
+            price = _fill_of(fresh)
+            if price is not None:
+                return price
+            status = str((fresh or {}).get("status", "")).lower()
+            if status in ("canceled", "cancelled", "rejected", "expired"):
+                print(f"  [monitor] close order for {trade.symbol} ended {status}")
+                return None
+            print(f"  [monitor] waiting on {trade.symbol} close fill "
+                  f"({i + 1}/{attempts}, status={status or 'unknown'})")
+        return None
 
     def _refresh_stats(self):
         try:

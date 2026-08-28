@@ -140,6 +140,26 @@ def confirm_trade_fill(db: Session, trade_id, fill_price: float,
     return trade
 
 
+def update_trade_quantity(db: Session, trade_id, filled_qty: float) -> Trade:
+    """
+    Keep a still-PENDING trade's quantity in step with what has actually
+    filled so far.
+
+    A partially filled order stays PENDING_FILL (see execution/order_tracker),
+    but the quantity on the row must track reality in the meantime. When the
+    row said 20 and the broker had filled 15, every downstream number — P&L,
+    R, the expectancy gate — was computed against a size that did not exist.
+    """
+    trade = db.query(Trade).filter(Trade.id == trade_id).first()
+    if not trade:
+        raise ValueError(f"Trade {trade_id} not found")
+    if filled_qty and filled_qty > 0:
+        trade.quantity = filled_qty
+        db.commit()
+        db.refresh(trade)
+    return trade
+
+
 def cancel_pending_trade(db: Session, trade_id, reason: str = "order_not_filled") -> Trade:
     """Mark a PENDING_FILL trade as CANCELLED — the order never became a position."""
     trade = db.query(Trade).filter(Trade.id == trade_id).first()

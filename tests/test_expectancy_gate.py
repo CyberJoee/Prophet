@@ -43,6 +43,7 @@ db = SessionLocal()
 
 NOW = datetime(2026, 8, 22)
 
+NL = chr(10)
 failures = []
 
 
@@ -55,6 +56,23 @@ def check(label, cond, detail=""):
 
 def reset():
     db.query(Trade).delete()
+    db.commit()
+
+
+def add_reconstructed(setup, r_values, when=None, source="alpaca_sync"):
+    """Sync-imported trades. Historically these carried an INVENTED stop, so
+    they looked perfectly scorable while their R was fiction."""
+    when = when or (NOW - timedelta(days=5))
+    for i, r in enumerate(r_values):
+        db.add(Trade(
+            symbol="RECON", asset_type=AssetType.STOCK, setup_type=setup,
+            side=OrderSide.BUY, status=TradeStatus.CLOSED,
+            entry_price=100.0, entry_time=when + timedelta(seconds=i),
+            quantity=10.0, planned_stop=99.0,          # invented, but present
+            exit_price=100.0 + r, exit_time=when + timedelta(minutes=i + 1),
+            exit_reason="reconciled", pnl=r * 10.0, pnl_pct=r,
+            entry_context={"source": source, "reconstructed": True},
+        ))
     db.commit()
 
 
@@ -269,6 +287,55 @@ check("but its scale is 0.5", G.setup_scale(g, "reversal") == 0.5,
       str(G.setup_scale(g, "reversal")))
 check("suspended scale 0 would skip in sizing.py",
       G.setup_scale(G.assess_setups(db, now=NOW), "reversal") > 0)
+
+# -- 14. Reconstructed trades are never scored ------------------------------
+print(NL + "=== 14. Broker-reconstructed trades are excluded ===")
+reset()
+add_reconstructed(SetupType.ORB, [-0.6, -0.4] * 12)   # would suspend if scored
+g = G.assess_setups(db, now=NOW)
+o = g["setups"]["orb"]
+check("not scored", o["n"] == 0, str(o["n"]))
+check("counted as reconstructed", o["n_reconstructed"] == 24, str(o["n_reconstructed"]))
+check("NOT counted as merely unscorable", o["n_unscored"] == 0, str(o["n_unscored"]))
+check("no verdict from them", o["state"] == G.ALLOWED, o["state"])
+check("not suspended", "orb" not in g["suspended"], str(g["suspended"]))
+check("reason explains the exclusion", "reconstructed" in o["reason"], o["reason"])
+
+print(NL + "--- a real losing setup still suspends alongside them ---")
+reset()
+add_reconstructed(SetupType.MOMENTUM, [0.9] * 20)     # flattering fiction
+add_trades(SetupType.MOMENTUM, [-0.6, -0.4] * 12)     # the real record
+g = G.assess_setups(db, now=NOW)
+m = g["setups"]["momentum"]
+check("only real trades scored", m["n"] == 24, str(m["n"]))
+check("reconstructed ones set aside", m["n_reconstructed"] == 20,
+      str(m["n_reconstructed"]))
+check("fiction did not rescue it", m["state"] == G.SUSPENDED, m["state"])
+check("expectancy is the real -0.5R", abs(m["expectancy_r"] + 0.5) < 0.01,
+      str(m["expectancy_r"]))
+
+print(NL + "--- is_reconstructed handles every context shape ---")
+
+
+class _Ctx:
+    def __init__(self, ctx):
+        self.entry_context = ctx
+
+
+check("dict with source", G.is_reconstructed(_Ctx({"source": "alpaca_sync"})))
+check("dict with flag", G.is_reconstructed(_Ctx({"reconstructed": True})))
+check("JSON string", G.is_reconstructed(_Ctx('{"source": "alpaca_sync"}')))
+check("native trade is not", not G.is_reconstructed(_Ctx({"reasoning": "real"})))
+check("None context is not", not G.is_reconstructed(_Ctx(None)))
+check("malformed string is not", not G.is_reconstructed(_Ctx("not json")))
+
+# -- 15. Sync no longer invents a stop --------------------------------------
+print(NL + "=== 15. alpaca_sync stores no fabricated stop ===")
+_sync_src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              "execution", "alpaca_sync.py"), encoding="utf-8").read()
+check("the 2%-of-price guess is gone", "current * 0.02" not in _sync_src)
+check("stop is explicitly None", "stop       = None" in _sync_src)
+check("imports are marked reconstructed", 'reconstructed' in _sync_src)
 
 print("\n" + ("ALL PASS" if not failures else f"{len(failures)} FAILURE(S): {failures}"))
 sys.exit(1 if failures else 0)

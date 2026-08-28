@@ -54,7 +54,8 @@ def main():
             print("  No verdicts produced.")
             return 0
 
-        hdr = f"  {'setup':14s} {'verdict':10s} {'size':>6s} {'n':>4s} {'unscored':>9s} {'exp':>8s} {'upper':>8s}"
+        hdr = (f"  {'setup':14s} {'verdict':10s} {'size':>6s} {'n':>4s} "
+               f"{'unscored':>9s} {'rebuilt':>8s} {'exp':>8s} {'upper':>8s}")
         print(hdr)
         print("  " + "-" * (len(hdr) - 2))
         for key in sorted(setups):
@@ -62,7 +63,8 @@ def main():
             exp   = f"{e['expectancy_r']:+.2f}R" if e["expectancy_r"] is not None else "   -"
             upper = f"{e['upper_bound']:+.2f}R" if e["upper_bound"] is not None else "   -"
             print(f"  {key:14s} {e['state']:10s} {e['scale']:>5.0%} {e['n']:>4d} "
-                  f"{e['n_unscored']:>9d} {exp:>8s} {upper:>8s}")
+                  f"{e['n_unscored']:>9d} {e.get('n_reconstructed', 0):>8d} "
+                  f"{exp:>8s} {upper:>8s}")
 
         print()
         for key in sorted(setups):

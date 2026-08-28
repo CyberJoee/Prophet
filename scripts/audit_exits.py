@@ -230,9 +230,9 @@ def check_exit_price_fidelity(db, use_bars: bool):
 
 def check_fabricated_stops(db):
     from db.models import Trade, TradeStatus
-    from agents.expectancy_gate import trade_r_multiple
+    from agents.expectancy_gate import trade_r_multiple, is_reconstructed
     from db.operations import get_stats_cutoff
-    print("\n4. FABRICATED STOPS FEEDING THE EXPECTANCY GATE")
+    print("\n4. FABRICATED STOPS — ARE THEY STILL REACHING THE GATE?")
     print("-" * 78)
 
     lookback = int(os.getenv("EXPECTANCY_LOOKBACK_DAYS", "60"))
@@ -242,26 +242,48 @@ def check_fabricated_stops(db):
             .filter(Trade.status == TradeStatus.CLOSED,
                     Trade.entry_time >= cutoff)
             .all())
-    bad = [t for t in rows if _is_synced(t) and trade_r_multiple(t) is not None]
+    # Rows carrying a sync-invented stop. alpaca_sync stopped writing these on
+    # 2026-08-28, but the historical rows still hold the fabricated value —
+    # this audit reads stored data and cannot un-write the past.
+    stale = [t for t in rows if _is_synced(t) and trade_r_multiple(t) is not None]
+
+    # What actually matters is whether the gate would SCORE any of them. Since
+    # 2026-08-28 it excludes reconstructed trades outright, so a fabricated
+    # stop sitting in an excluded row is inert. Reporting those as live
+    # contamination — which this check used to do — overstates the problem.
+    still_scored = [t for t in stale if not is_reconstructed(t)]
 
     print(f"   {len(rows)} closed trade(s) inside the gate's window "
           f"(since {cutoff.date()}).")
-    if not bad:
-        print("   None of them carry a sync-invented stop. The gate's R values "
-              "are computed from real planned stops.")
+
+    if not stale:
+        print("   No sync-invented stops anywhere in the window.")
         return
 
-    print(f"\n   *** {len(bad)} trade(s) are scored on an INVENTED stop.")
-    print("       _sync_open_positions sets planned_stop from a 2%-of-price "
-          "guess, so their R is fiction.\n")
+    print("")
     per_setup = defaultdict(int)
-    for t in bad:
+    for t in stale:
         setup = t.setup_type.value if hasattr(t.setup_type, "value") else str(t.setup_type)
         per_setup[setup] += 1
+        state = "excluded" if is_reconstructed(t) else "STILL SCORED"
         print(f"   {t.symbol:<6} {setup:<13} entry=${t.entry_price:<9.2f} "
               f"stop=${t.planned_stop:<9.2f} pnl=${t.pnl or 0:+9.2f} "
-              f"R={trade_r_multiple(t):+.2f}")
-    print(f"\n   affected setup buckets: {dict(per_setup)}")
+              f"R={trade_r_multiple(t):+.2f}  [{state}]")
+
+    if not still_scored:
+        print("")
+        print(f"   {len(stale)} historical row(s) still carry a fabricated stop, "
+              "but every one is excluded")
+        print("   from the gate as broker-reconstructed, so none influences a "
+              "suspension. The rows are")
+        print("   left as they are on purpose: the history is wrong and stays "
+              "auditable rather than being")
+        print("   quietly rewritten.")
+        return
+
+    print("")
+    print(f"   *** {len(still_scored)} trade(s) are STILL SCORED on an invented stop.")
+    print(f"   affected setup buckets: {dict(per_setup)}")
     print("   Any suspension decision on those buckets rests partly on "
           "fabricated risk.")
 

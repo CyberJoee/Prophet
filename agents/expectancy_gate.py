@@ -66,11 +66,19 @@ however many times it is called.
 CONFIGURATION
 -------------
   EXPECTANCY_GATE            on|off             (default on)
-  EXPECTANCY_WINDOW          trades per setup   (default 30)
+  EXPECTANCY_WINDOW          USABLE trades per setup (default 30)
   EXPECTANCY_MIN_TRADES      min sample to act  (default 20)
   EXPECTANCY_LOOKBACK_DAYS   aging window       (default 60)
   EXPECTANCY_Z               strictness         (default 1.0)
   EXPECTANCY_REDUCED_SCALE   size when reduced  (default 0.5)
+
+WHAT IS NEVER SCORED
+--------------------
+Trades that alpaca_sync reconstructed from a broker position are excluded
+outright (see is_reconstructed). They are not strategy decisions: entry time
+is whenever the sync ran, setup type is guessed, and until 2026-08-28 the
+stop was invented as a flat 2% of price — which meant R, the number this gate
+suspends setups on, had a fabricated denominator.
 
 Fails OPEN (all setups allowed) if anything goes wrong, but says so loudly
 in `errors` and in the printed reason — a bug in this file must not silently
@@ -104,6 +112,33 @@ def _cfg_float(name: str, default: float) -> float:
 
 def is_enabled() -> bool:
     return os.getenv("EXPECTANCY_GATE", "on").strip().lower() not in ("off", "0", "false", "no")
+
+
+def is_reconstructed(trade) -> bool:
+    """
+    True for a trade alpaca_sync built from a broker position rather than one
+    the strategy decided.
+
+    These are reconstructions. Their entry time is whenever the sync happened,
+    the setup type is guessed from a nearby decision row, and historically the
+    stop was invented outright. The audit of 2026-08-28 found eighteen of them
+    created when a position the system believed closed was still held.
+
+    Whatever they are, they are not evidence about whether a setup works, so
+    the gate does not score them. Excluding at read time rather than deleting
+    the rows keeps the audit trail intact — the history is still wrong, it is
+    just no longer trusted.
+    """
+    ctx = getattr(trade, "entry_context", None)
+    if isinstance(ctx, str):
+        import json
+        try:
+            ctx = json.loads(ctx)
+        except Exception:
+            return False
+    if not isinstance(ctx, dict):
+        return False
+    return bool(ctx.get("reconstructed")) or ctx.get("source") == "alpaca_sync"
 
 
 def trade_r_multiple(trade) -> float | None:
@@ -178,17 +213,28 @@ def assess_setups(db, now: datetime = None) -> dict:
 
         for setup in SetupType:
             key = setup.value
+            # No SQL LIMIT here. The window is "the last N USABLE trades",
+            # not "the last N rows" — applying the limit first let excluded
+            # rows eat the window and silently starve the sample. A run of
+            # broker-reconstructed imports could push the real trades out and
+            # drop a setup below min_trades, quietly switching the gate off
+            # for it. The date cutoff already bounds how much this scans.
             rows = (db.query(Trade)
                       .filter(Trade.status == TradeStatus.CLOSED,
                               Trade.setup_type == setup,
                               Trade.entry_time >= cutoff)
                       .order_by(Trade.exit_time.desc())
-                      .limit(window)
                       .all())
 
             rs = []
             unscored = 0
+            reconstructed = 0
             for t in rows:
+                if len(rs) >= window:
+                    break
+                if is_reconstructed(t):
+                    reconstructed += 1
+                    continue
                 r = trade_r_multiple(t)
                 if r is None:
                     unscored += 1
@@ -198,6 +244,7 @@ def assess_setups(db, now: datetime = None) -> dict:
             entry = {
                 "state": ALLOWED, "scale": 1.0,
                 "n": len(rs), "n_unscored": unscored,
+                "n_reconstructed": reconstructed,
                 "expectancy_r": None, "stdev_r": None,
                 "stderr": None, "upper_bound": None,
                 "reason": "",
@@ -210,6 +257,9 @@ def assess_setups(db, now: datetime = None) -> dict:
                 )
                 if unscored:
                     entry["reason"] += f"; {unscored} unscorable (no planned_stop)"
+                if reconstructed:
+                    entry["reason"] += (f"; {reconstructed} excluded as "
+                                        "broker-reconstructed")
                 out["setups"][key] = entry
                 continue
 

@@ -84,11 +84,20 @@ def _sync_open_positions(client, db) -> int:
             market_val = float(pos.market_value)
             unrealized = float(pos.unrealized_pl)
 
-            # Estimate stop and target from current price
+            # NO INVENTED STOP. This used to store a 2%-of-price guess as
+            # planned_stop, which looked like a real risk level and was not
+            # one: no such order exists at the broker for a synced position,
+            # and nothing enforces it. Worse, the expectancy gate divides P&L
+            # by (entry - planned_stop) to get R, so a fabricated stop became
+            # a fabricated risk denominator feeding a mechanism that now
+            # suspends setups.
+            #
+            # Leaving it NULL is the truthful record and makes the trade
+            # correctly unscorable. The position is still closed at end of
+            # day like any other; what it never had was a stop.
             current    = float(pos.current_price)
-            atr_est    = current * 0.02  # rough 2% ATR estimate
-            stop       = round(current - 2 * atr_est, 2) if side == "buy" else round(current + 2 * atr_est, 2)
-            target     = round(current + 4 * atr_est, 2) if side == "buy" else round(current - 4 * atr_est, 2)
+            stop       = None
+            target     = None
 
             # Try to infer setup type from agent_decisions for this symbol
             inferred_setup = SetupType.MOMENTUM  # default to momentum not custom
@@ -121,9 +130,13 @@ def _sync_open_positions(client, db) -> int:
                 planned_target=target,
                 entry_context={
                     "source":        "alpaca_sync",
+                    "reconstructed": True,
                     "market_value":  market_val,
                     "unrealized_pl": unrealized,
                     "synced_at":     datetime.utcnow().isoformat(),
+                    "note": ("imported from a broker position; entry, setup "
+                             "and risk were not chosen by the strategy — no "
+                             "planned stop exists for this trade"),
                 },
             )
             db.add(trade)

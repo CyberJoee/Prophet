@@ -72,6 +72,7 @@ from execution.position_monitor import PositionMonitor
 Base.metadata.create_all(bind=engine)
 db = SessionLocal()
 
+NL = chr(10)
 failures = []
 
 
@@ -237,6 +238,25 @@ tr, b = eod_with({"id": None, "symbol": "SPY", "status": "failed",
 check("NOT marked closed", tr.status == TradeStatus.OPEN, str(tr.status))
 
 # ── C. Reconciliation ───────────────────────────────────────────────────────
+print(NL + "--- EOD reconciles even when the DB thinks it is already flat ---")
+reset()   # no open trades at all -> end_of_day takes its early-return path
+b_flat = FakeBroker(positions={"GHOST": {"symbol": "GHOST", "qty": 5}})
+m_flat = PositionMonitor(data_provider=_StubProvider(),
+                         db_session=db, execution_client=b_flat)
+m_flat._close_attempts, m_flat._close_delay = 1, 0
+check("end_of_day exposes the shared reconcile helper",
+      hasattr(m_flat, "_post_eod_reconcile"))
+m_flat.end_of_day()
+_rec = reconcile(db, b_flat)
+check("a broker-only position is still caught on the flat path",
+      _rec["untracked"] == ["GHOST"], str(_rec))
+
+_pm_src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "execution", "position_monitor.py"), encoding="utf-8").read()
+check("both end_of_day exits reconcile",
+      _pm_src.count("self._post_eod_reconcile()") == 2,
+      str(_pm_src.count("self._post_eod_reconcile()")))
+
 print("\n=== C. Reconciliation reports disagreement loudly ===")
 reset()
 make_trade(symbol="NVDA", status=TradeStatus.OPEN, order_id="o-nvda")

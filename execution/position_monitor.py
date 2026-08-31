@@ -273,9 +273,14 @@ class PositionMonitor:
 
         open_trades = get_open_trades(self.db)
         if not open_trades:
+            # "Nothing left open" is the DATABASE's opinion, and the database
+            # being wrong about that is the entire failure this check exists
+            # to catch. Reconcile before returning, or the one day the broker
+            # still holds something is the one day nobody looks.
             print("  [monitor] EOD — nothing left open")
             self._save_snapshot()
             self._refresh_stats()
+            self._post_eod_reconcile()
             return
 
         symbols = list({t.symbol for t in open_trades})
@@ -335,10 +340,16 @@ class PositionMonitor:
 
         self._save_snapshot()
         self._refresh_stats()
+        self._post_eod_reconcile()
 
-        # Standing check that we actually ended the day flat. The individual
-        # bugs that caused untracked positions are fixed; this catches the
-        # next one.
+    def _post_eod_reconcile(self):
+        """
+        Standing check that the day really ended flat.
+
+        Called on BOTH end_of_day exits. It first shipped only on the path
+        that closes positions, which meant a day the DB thought was already
+        flat skipped the check — precisely the case it was written for.
+        """
         try:
             from execution.reconciliation import reconcile, log_reconciliation
             result = reconcile(self.db, self.broker, context="after EOD close")

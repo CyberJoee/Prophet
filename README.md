@@ -1,141 +1,73 @@
-# Prophet — Autonomous Paper Trading Agent
+# Prophet
 
-Multi-agent paper trading system for US equities and options using Claude as the reasoning engine.
+Live Heikin Ashi + WaveTrend chart dashboard. A self-hosted, free replacement
+for a paid TradingView setup: HA candles, WaveTrend oscillator, money flow,
+EMAs, and a signal backtest, refreshed automatically throughout the day and
+served as a web page.
 
-## Architecture
+Started as a HBAR/USD reconstruction of a TradingView "Market Cipher B"-style
+chart; built to add more symbols over time.
 
-```
-Data Layer      → Alpaca (live) / Mock (testing)
-Agent Layer     → Research → Strategy → Risk → Journal (all Claude-powered)
-Memory Layer    → PostgreSQL + pgvector (semantic trade similarity)
-Execution       → Alpaca Paper Trading API
-Dashboard       → React/Vite (Phase 2)
-```
+## How it works
 
-## Stack
+- `app/strategy.py` -- data fetch (free OHLCV via `ccxt`, no API key) +
+  indicators (Heikin Ashi, WaveTrend, money flow, EMAs, ATR) + backtester.
+  Fetches from Coinbase by default; if Coinbase's listing history doesn't
+  cover the requested start date, it automatically checks other exchanges
+  (Binance, Kraken, Bitfinex, OKX, Bybit, KuCoin, Huobi, Poloniex) for one
+  with deeper history and switches the whole series to that single exchange
+  (no stitching across sources, to avoid a price discontinuity at the seam).
+- `app/chart.py` -- builds the Plotly figure (candles, EMAs, WaveTrend pane,
+  money flow, equity curve) as an embeddable HTML fragment.
+- `app/main.py` -- FastAPI app. A background thread refreshes every symbol/
+  timeframe on an interval and caches the rendered chart HTML in memory; the
+  `/` route just serves the latest cached render, so page loads are instant
+  and the page itself auto-refreshes on a meta tag to pick up new data.
 
-- **Python 3.12** — FastAPI backend
-- **PostgreSQL 16 + pgvector** — trade journal and vector memory
-- **Alpaca Markets** — paper trading (free account at alpaca.markets)
-- **Claude API** — multi-agent reasoning core
-- **pandas-ta** — technical indicators
-- **APScheduler** — market session scheduling (Phase 2)
+## Strategy spec
 
-## Quick Start
+**Signal source:** Heikin Ashi values computed from real OHLC. Signals come
+from HA values; **fills always use real prices** -- a backtest that fills at
+HA prices is fake.
 
-### 1. Prerequisites
+- `ha_close = (o+h+l+c)/4`
+- `ha_open = (prev_ha_open + prev_ha_close)/2`, seeded on bar 0 with `(o+c)/2`
+- `ha_high = max(h, ha_open, ha_close)`, `ha_low = min(l, ha_open, ha_close)`
+
+**WaveTrend** (defaults: channel 9, average 12, MA 3):
+
+- `ap = hlc3`, `esa = EMA(ap, 9)`, `d = EMA(|ap-esa|, 9)`
+- `ci = (ap - esa) / (0.015*d)`, `wt1 = EMA(ci, 12)`, `wt2 = SMA(wt1, 3)`
+- Green dot: wt1 crosses above wt2 while wt2 <= buy_zone (default 0)
+- Red dot: wt1 crosses below wt2 while wt2 >= sell_zone (default 0)
+
+**Money flow:** `SMA(((c-o)/(h-l))*150, 60) - 2.5`, on HA values.
+
+**Entry (long only):** green dot + close above slow EMA (21) by default.
+**Exit:** red dot (default), or an ATR(14) x 2 stop off the signal bar's
+close, whichever comes first. Fees: 0.1% per side, full equity per trade, no
+pyramiding, no lookahead -- signal at bar close, fill at next bar's real open.
+
+## Local dev
 
 ```bash
-# PostgreSQL 16 + pgvector
-brew install postgresql@16
-pip install pgvector  # or apt-get install postgresql-16-pgvector
-
-# Python deps
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+uvicorn app.main:app --reload
 ```
 
-### 2. Configure
+Open http://localhost:8000
 
-```bash
-cp .env.example .env
-# Fill in: ALPACA_API_KEY, ALPACA_SECRET_KEY, ANTHROPIC_API_KEY
-```
+## Config (env vars)
 
-Get your free Alpaca paper trading keys at: https://alpaca.markets
-
-### 3. Database setup
-
-```bash
-createuser prophet -P            # password: prophet
-createdb prophet -O prophet
-psql -d prophet -c "CREATE EXTENSION vector;"
-python3 scripts/init_db.py       # creates tables + seeds watchlist
-```
-
-### 4. Run tests (no API keys needed)
-
-```bash
-python3 -m pytest tests/test_suite.py -v
-# Expected: 25 passed
-```
-
-### 5. Run in mock mode (no API keys needed)
-
-```bash
-# All data and execution are simulated
-DATA_PROVIDER=mock EXECUTION_CLIENT=mock python3 scripts/run_once.py
-```
-
-### 6. Run with real Alpaca paper trading
-
-```bash
-# Set DATA_PROVIDER=alpaca EXECUTION_CLIENT=alpaca in .env
-python3 scripts/run_once.py
-```
-
-## Environment Variables
-
-| Variable | Default | Description |
+| Var | Default | Meaning |
 |---|---|---|
-| `ALPACA_API_KEY` | — | Alpaca paper trading key |
-| `ALPACA_SECRET_KEY` | — | Alpaca paper trading secret |
-| `ALPACA_BASE_URL` | paper-api.alpaca.markets | Use paper URL always |
-| `ANTHROPIC_API_KEY` | — | Claude API key |
-| `DATABASE_URL` | postgresql://prophet:prophet@localhost:5432/prophet | Postgres connection |
-| `DATA_PROVIDER` | `mock` | `mock` or `alpaca` |
-| `EXECUTION_CLIENT` | `mock` | `mock` or `alpaca` |
+| `SYMBOLS` | `HBAR/USD` | Comma-separated list, e.g. `HBAR/USD,BTC/USD,ETH/USD` |
+| `TIMEFRAMES` | `1d,1w` | Comma-separated: `1d`, `3d`, `1w`, `1M` |
+| `SINCE` | `2021-01-01` | Backtest/chart start date |
+| `EXCHANGE` | `coinbase` | Primary exchange; auto-backfills from others if it doesn't cover `SINCE` |
+| `REFRESH_SECONDS` | `900` | How often the background job recomputes and the page auto-reloads |
 
-## Project Structure
+## Deploy (Railway)
 
-```
-prophet/
-├── agents/
-│   ├── research_agent.py    # Morning scan — calls Claude for market briefing
-│   └── strategy_agent.py    # Trade planning — calls Claude for entry decisions
-├── data/
-│   └── market_data.py       # DataProvider: MockDataProvider + AlpacaDataProvider
-├── db/
-│   ├── connection.py        # SQLAlchemy engine + session
-│   ├── models.py            # All ORM models (trades, journal, stats, decisions)
-│   └── operations.py        # CRUD operations for all agents
-├── execution/
-│   └── broker.py            # ExecutionClient: MockExecutionClient + AlpacaExecutionClient
-├── tests/
-│   └── test_suite.py        # 25 tests covering all components
-├── scripts/
-│   ├── init_db.py           # One-time DB setup
-│   └── run_once.py          # Single full pipeline run (for testing)
-└── .env.example
-```
-
-## Phase Roadmap
-
-- [x] **Phase 1** — Data, DB schema, mock providers, research + strategy agents, 25 tests
-- [ ] **Phase 2** — APScheduler (9:45am scan, 10am trade, 4:15pm journal), position monitor with trailing stops
-- [ ] **Phase 3** — Journal agent (post-trade analysis), pgvector embeddings for trade memory
-- [ ] **Phase 4** — Backtesting engine (replay historical data through agents)
-- [ ] **Phase 5** — React/Vite dashboard (live P&L, reasoning log, equity curve)
-
-## Switching to Live Alpaca Paper Trading
-
-1. Sign up at https://alpaca.markets (free)
-2. Get your paper trading API keys from the dashboard
-3. Add to `.env`:
-   ```
-   ALPACA_API_KEY=PKxxxxx
-   ALPACA_SECRET_KEY=xxxxx
-   ALPACA_BASE_URL=https://paper-api.alpaca.markets
-   DATA_PROVIDER=alpaca
-   EXECUTION_CLIENT=alpaca
-   ```
-4. Run: `python3 scripts/run_once.py`
-
-**Note:** Paper trading uses real market data but no real money. Safe to run during market hours.
-
-## Risk Controls (always active)
-
-- Max 2% portfolio risk per trade (position sized by stop distance)
-- Max 15% of equity per position (prevents over-concentration)
-- Limit orders only (no market orders)
-- No trading outside market hours
-- All decisions logged to `agent_decisions` table for review
+Service start command: `uvicorn app.main:app --host 0.0.0.0 --port $PORT`

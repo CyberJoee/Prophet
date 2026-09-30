@@ -94,6 +94,12 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .stat b {{ color:#8FC7FF; }}
   .err {{ color:#ff6b6b; font-size:13px; }}
   .tf-label {{ color:#aaa; font-size:13px; text-transform:uppercase; letter-spacing:.05em; }}
+  @media (max-width: 480px) {{
+    body {{ padding:12px; }}
+    h1 {{ font-size:22px; }}
+    .card {{ padding:10px; border-radius:8px; }}
+    .stat {{ padding:6px 10px; font-size:13px; }}
+  }}
 </style>
 </head>
 <body>

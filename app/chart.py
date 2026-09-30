@@ -38,7 +38,19 @@ def build_html(d: pd.DataFrame, tr: pd.DataFrame, a: Params, symbol: str, tf: st
         fig.add_hline(y=y, line=dict(color="gray", dash="dot" if y else "solid", width=1), row=2, col=1)
 
     fig.add_trace(go.Scatter(x=d.index, y=d.equity, name="Equity", line=dict(color="orange")), 3, 1)
-    fig.update_layout(template="plotly_dark", title=f"{symbol} {tf} - HA WaveTrend",
-                       xaxis_rangeslider_visible=False, height=850, hovermode="x unified",
-                       margin=dict(t=50, b=30))
-    return fig.to_html(full_html=False, include_plotlyjs=False, div_id=div_id)
+    fig.update_layout(
+        template="plotly_dark",
+        # No fig-level title: the dashboard card header above the chart
+        # already shows "{symbol} · {tf}", and a title collides with the
+        # legend once it wraps to multiple rows on a narrow screen.
+        xaxis_rangeslider_visible=False, height=850, hovermode="x unified",
+        margin=dict(t=90, b=30, l=45, r=15),
+        # A right-side vertical legend eats most of the width on a phone
+        # screen, squeezing the chart into a sliver. A compact legend strip
+        # above the plot (wrapped, small font) keeps the chart full-width on
+        # any viewport; the extra top margin gives it room to wrap to 2-3
+        # rows without overlapping the plot area.
+        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left", x=0, font=dict(size=10)),
+    )
+    return fig.to_html(full_html=False, include_plotlyjs=False, div_id=div_id,
+                        config={"responsive": True, "displaylogo": False})

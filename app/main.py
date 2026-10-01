@@ -83,6 +83,13 @@ def startup() -> None:
     threading.Thread(target=_populate_then_loop, daemon=True).start()
 
 
+TF_LABELS = {"1d": "Day", "3d": "3-Day", "1w": "Week", "1M": "Month"}
+
+
+def _slug(symbol: str) -> str:
+    return symbol.replace("/", "-")
+
+
 PAGE_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -94,30 +101,117 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <style>
   body {{ background:#111318; color:#eee; font-family: -apple-system, Segoe UI, sans-serif; margin:0; padding:24px; }}
   h1 {{ font-weight:600; margin-bottom:4px; }}
-  .meta {{ color:#888; font-size:13px; margin-bottom:24px; }}
-  .card {{ background:#1a1d24; border-radius:10px; padding:16px; margin-bottom:24px; }}
+  .meta {{ color:#888; font-size:13px; margin-bottom:20px; }}
+  .card {{ background:#1a1d24; border-radius:10px; padding:16px; }}
   .stats {{ display:flex; flex-wrap:wrap; gap:16px; margin:8px 0 16px; font-size:14px; }}
   .stat {{ background:#20242e; border-radius:6px; padding:8px 14px; }}
   .stat b {{ color:#8FC7FF; }}
   .err {{ color:#ff6b6b; font-size:13px; }}
-  .tf-label {{ color:#aaa; font-size:13px; text-transform:uppercase; letter-spacing:.05em; }}
+
+  .tabs {{ display:flex; flex-wrap:wrap; gap:8px; margin-bottom:16px; }}
+  .tab-btn {{
+    background:#1a1d24; color:#aaa; border:1px solid #2a2e38; border-radius:8px;
+    padding:9px 18px; font-size:15px; font-weight:600; cursor:pointer;
+  }}
+  .tab-btn.active {{ background:#2a3350; color:#8FC7FF; border-color:#3b4a7a; }}
+  .tab-btn:hover {{ color:#eee; }}
+
+  .tf-tabs {{ display:flex; gap:6px; margin-bottom:14px; }}
+  .tf-btn {{
+    background:transparent; color:#888; border:1px solid #2a2e38; border-radius:20px;
+    padding:5px 16px; font-size:13px; font-weight:600; cursor:pointer;
+  }}
+  .tf-btn.active {{ background:#20242e; color:#eee; border-color:#444; }}
+  .tf-btn:hover {{ color:#eee; }}
+
   @media (max-width: 480px) {{
     body {{ padding:12px; }}
     h1 {{ font-size:22px; }}
     .card {{ padding:10px; border-radius:8px; }}
     .stat {{ padding:6px 10px; font-size:13px; }}
+    .tab-btn {{ padding:8px 14px; font-size:14px; }}
   }}
 </style>
 </head>
 <body>
 <h1>Prophet</h1>
 <div class="meta">HA WaveTrend live dashboard &middot; auto-refreshes every {refresh_min} min &middot; page rendered {now}</div>
-{sections}
+<div class="tabs">{symbol_tabs}</div>
+{symbol_panels}
+<script>
+function showSymbol(sym) {{
+  document.querySelectorAll('.symbol-panel').forEach(function(el) {{ el.style.display = 'none'; }});
+  document.querySelectorAll('.tab-btn').forEach(function(el) {{ el.classList.remove('active'); }});
+  var panel = document.getElementById('panel-' + sym);
+  var btn = document.getElementById('tab-' + sym);
+  if (!panel || !btn) return;
+  panel.style.display = 'block';
+  btn.classList.add('active');
+  try {{ localStorage.setItem('prophet_symbol', sym); }} catch (e) {{}}
+  var activeTfBtn = panel.querySelector('.tf-btn.active');
+  if (activeTfBtn) resizeChartsIn(sym, activeTfBtn.dataset.tf);
+}}
+function showTf(sym, tf) {{
+  var panel = document.getElementById('panel-' + sym);
+  if (!panel) return;
+  panel.querySelectorAll('.tf-panel').forEach(function(el) {{ el.style.display = 'none'; }});
+  panel.querySelectorAll('.tf-btn').forEach(function(el) {{ el.classList.remove('active'); }});
+  var tfPanel = document.getElementById('tfpanel-' + sym + '-' + tf);
+  var tfBtn = document.getElementById('tftab-' + sym + '-' + tf);
+  if (!tfPanel || !tfBtn) return;
+  tfPanel.style.display = 'block';
+  tfBtn.classList.add('active');
+  try {{ localStorage.setItem('prophet_tf_' + sym, tf); }} catch (e) {{}}
+  resizeChartsIn(sym, tf);
+}}
+function resizeChartsIn(sym, tf) {{
+  var container = document.getElementById('tfpanel-' + sym + '-' + tf);
+  if (!container) return;
+  container.querySelectorAll('.plotly-graph-div').forEach(function(div) {{
+    try {{ Plotly.Plots.resize(div); }} catch (e) {{}}
+  }});
+}}
+(function init() {{
+  var savedSym = null, savedTf = {{}};
+  try {{
+    savedSym = localStorage.getItem('prophet_symbol');
+    document.querySelectorAll('.symbol-panel').forEach(function(el) {{
+      var s = el.dataset.sym;
+      var saved = localStorage.getItem('prophet_tf_' + s);
+      if (saved) savedTf[s] = saved;
+    }});
+  }} catch (e) {{}}
+
+  // Every symbol panel needs an active tf-panel, not just the one shown on
+  // load -- otherwise switching to a symbol you haven't viewed yet (no saved
+  // tf) lands on an empty panel with no sub-tab highlighted.
+  document.querySelectorAll('.symbol-panel').forEach(function(el) {{
+    var s = el.dataset.sym;
+    var wanted = savedTf[s];
+    if (!wanted || !document.getElementById('tfpanel-' + s + '-' + wanted)) {{
+      var firstTfBtn = el.querySelector('.tf-btn');
+      wanted = firstTfBtn ? firstTfBtn.dataset.tf : null;
+    }}
+    if (wanted) showTf(s, wanted);
+  }});
+
+  var sym = savedSym;
+  if (!sym || !document.getElementById('panel-' + sym)) {{
+    var first = document.querySelector('.symbol-panel');
+    sym = first ? first.dataset.sym : null;
+  }}
+  if (sym) showSymbol(sym);
+}})();
+</script>
 </body>
 </html>"""
 
-SECTION_TEMPLATE = """<div class="card">
-  <span class="tf-label">{symbol} &middot; {tf}</span>
+SYMBOL_PANEL_TEMPLATE = """<div class="symbol-panel card" id="panel-{slug}" data-sym="{slug}" style="display:none;">
+  <div class="tf-tabs">{tf_tabs}</div>
+  {tf_panels}
+</div>"""
+
+TF_PANEL_TEMPLATE = """<div class="tf-panel" id="tfpanel-{slug}-{tf}" style="display:none;">
   {stats_html}
   {body}
 </div>"""
@@ -144,19 +238,36 @@ def _stats_row(summary: dict | None, error: str | None) -> str:
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard() -> str:
-    sections = []
     with _cache_lock:
         snapshot = dict(_cache)
+
+    symbol_tabs, symbol_panels = [], []
     for symbol in SYMBOLS:
+        slug = _slug(symbol)
+        symbol_tabs.append(
+            f'<button class="tab-btn" id="tab-{slug}" onclick="showSymbol(\'{slug}\')">{html.escape(symbol)}</button>'
+        )
+
+        tf_tabs, tf_panels = [], []
         for tf in TIMEFRAMES:
+            label = TF_LABELS.get(tf, tf)
+            tf_tabs.append(
+                f'<button class="tf-btn" id="tftab-{slug}-{tf}" data-tf="{tf}" '
+                f'onclick="showTf(\'{slug}\',\'{tf}\')">{html.escape(label)}</button>'
+            )
             entry = snapshot.get((symbol, tf))
             body = entry["html"] if entry and entry.get("html") else "<div class='err'>Loading&hellip;</div>"
             stats_html = _stats_row(entry.get("summary") if entry else None, entry.get("error") if entry else None)
-            sections.append(SECTION_TEMPLATE.format(symbol=symbol, tf=tf, stats_html=stats_html, body=body))
+            tf_panels.append(TF_PANEL_TEMPLATE.format(slug=slug, tf=tf, stats_html=stats_html, body=body))
+
+        symbol_panels.append(SYMBOL_PANEL_TEMPLATE.format(
+            slug=slug, tf_tabs="".join(tf_tabs), tf_panels="\n".join(tf_panels),
+        ))
+
     return PAGE_TEMPLATE.format(
         refresh_seconds=REFRESH_SECONDS, refresh_min=REFRESH_SECONDS // 60,
         now=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-        sections="\n".join(sections),
+        symbol_tabs="".join(symbol_tabs), symbol_panels="\n".join(symbol_panels),
     )
 
 

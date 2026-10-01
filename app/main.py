@@ -34,6 +34,10 @@ SINCE = os.environ.get("SINCE", "2021-01-01")
 EXCHANGE = os.environ.get("EXCHANGE", "coinbase")
 REFRESH_SECONDS = int(os.environ.get("REFRESH_SECONDS", 15 * 60))
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+# Which timeframes actually fire Discord alerts. Daily dots on a WaveTrend
+# this fast flip constantly and would spam the channel; weekly is the one
+# worth getting pushed for. Still configurable in case that changes.
+ALERT_TIMEFRAMES = {t.strip() for t in os.environ.get("ALERT_TIMEFRAMES", "1w").split(",") if t.strip()}
 if DISCORD_WEBHOOK_URL.startswith("https://discordapp.com/"):
     # Legacy domain; discord.com is the current one and the one that's been
     # verified to work reliably with a plain urllib request.
@@ -85,6 +89,8 @@ def _send_discord_alert(symbol: str, tf: str, kind: str, summary: dict) -> None:
 
 
 def _check_alert(symbol: str, tf: str, summary: dict) -> None:
+    if tf not in ALERT_TIMEFRAMES:
+        return
     latest = summary["latest"]
     key = (symbol, tf)
     state = _alert_state.get(key) or {}

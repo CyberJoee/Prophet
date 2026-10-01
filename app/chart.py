@@ -52,5 +52,14 @@ def build_html(d: pd.DataFrame, tr: pd.DataFrame, a: Params, symbol: str, tf: st
         # rows without overlapping the plot area.
         legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left", x=0, font=dict(size=10)),
     )
+    # This is a glance-at-it dashboard, not an interactive analysis tool --
+    # drag-to-zoom/pan does more harm than good: on a phone, a touch meant to
+    # scroll the page lands on the chart and gets captured as a zoom/pan
+    # gesture instead, leaving the chart stuck zoomed in with no obvious way
+    # back out. Locking both axes removes that trap entirely; hover/tap for
+    # values still works.
+    fig.update_xaxes(fixedrange=True)
+    fig.update_yaxes(fixedrange=True)
     return fig.to_html(full_html=False, include_plotlyjs=False, div_id=div_id,
-                        config={"responsive": True, "displaylogo": False})
+                        config={"responsive": True, "displaylogo": False, "displayModeBar": False,
+                                "scrollZoom": False})

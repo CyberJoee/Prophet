@@ -273,6 +273,15 @@ def backtest(d: pd.DataFrame, a: Params, capital: float = 10_000.0):
     tr = pd.DataFrame(trades, columns=["entry_t", "exit_t", "entry", "exit", "reason"])
     if len(tr):
         tr["pct"] = (tr.exit / tr.entry * (1 - fee) ** 2 - 1) * 100
+    # Position still open at the end of the data (no close/stop has fired
+    # yet) -- not in `tr` since that only records realized trades. Dashboards
+    # and alerting need this to know whether a sell signal would actually
+    # close anything right now.
+    d.attrs["open_position"] = (
+        {"entry_t": entry_t.isoformat(), "entry_px": float(entry_px),
+         "stop": None if np.isnan(stop) else float(stop), "qty": float(qty)}
+        if qty > 0 else None
+    )
     return d, tr
 
 
@@ -280,10 +289,16 @@ def summarize(d: pd.DataFrame, tr: pd.DataFrame, capital: float = 10_000.0) -> d
     eq = d.equity
     dd = (eq / eq.cummax() - 1).min() * 100
     bh = (d.close.iloc[-1] / d.open.iloc[0] - 1) * 100
+    last = d.iloc[-1]
     out = {
         "start": d.index[0].date().isoformat(), "end": d.index[-1].date().isoformat(),
         "bars": len(d), "strategy_pct": round((eq.iloc[-1] / capital - 1) * 100, 1),
         "buy_hold_pct": round(bh, 1), "max_dd_pct": round(dd, 1), "trades": len(tr),
+        "position": d.attrs.get("open_position"),
+        "latest": {
+            "date": d.index[-1].date().isoformat(), "close": float(last.close),
+            "green_dot": bool(last.green_dot), "red_dot": bool(last.red_dot),
+        },
     }
     if len(tr):
         out["win_rate_pct"] = round((tr.pct > 0).mean() * 100)

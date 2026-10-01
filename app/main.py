@@ -10,10 +10,12 @@ Run locally:
     uvicorn app.main:app --reload
 """
 import html
+import json
 import logging
 import os
 import threading
 import time
+import urllib.request
 from datetime import datetime, timezone
 
 from fastapi import FastAPI
@@ -31,12 +33,70 @@ TIMEFRAMES = [t.strip() for t in os.environ.get("TIMEFRAMES", "1d,1w").split(","
 SINCE = os.environ.get("SINCE", "2021-01-01")
 EXCHANGE = os.environ.get("EXCHANGE", "coinbase")
 REFRESH_SECONDS = int(os.environ.get("REFRESH_SECONDS", 15 * 60))
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+if DISCORD_WEBHOOK_URL.startswith("https://discordapp.com/"):
+    # Legacy domain; discord.com is the current one and the one that's been
+    # verified to work reliably with a plain urllib request.
+    DISCORD_WEBHOOK_URL = "https://discord.com/" + DISCORD_WEBHOOK_URL[len("https://discordapp.com/"):]
 
 app = FastAPI(title="Prophet")
 
 # cache[(symbol, tf)] = {"html": str, "summary": dict, "updated_at": iso str, "error": str|None}
 _cache: dict[tuple[str, str], dict] = {}
 _cache_lock = threading.Lock()
+
+# alert_state[(symbol, tf)] = {"date": "2026-09-30", "green": bool, "red": bool}
+# Tracks which dot signals we've already alerted on for the current latest
+# bar, so a flickering intrabar recompute (the bar isn't closed yet) doesn't
+# re-fire the same alert on every refresh, and so a brand new bar's dots are
+# alerted exactly once.
+_alert_state: dict[tuple[str, str], dict] = {}
+# Set True only after the very first population pass completes, so a deploy
+# doesn't blast alerts for dots that already existed before this ran.
+_alerts_armed = False
+
+
+def _send_discord_alert(symbol: str, tf: str, kind: str, summary: dict) -> None:
+    if not DISCORD_WEBHOOK_URL:
+        return
+    label = TF_LABELS.get(tf, tf)
+    action = "🟢 BUY signal (green dot)" if kind == "green" else "🔴 SELL signal (red dot)"
+    pos = summary.get("position")
+    pos_line = (f"Open position: entered {pos['entry_t'][:10]} @ {pos['entry_px']:.5g}"
+                if pos else "No open position")
+    content = (f"**{action}**\n"
+               f"{symbol} · {label}\n"
+               f"Close: {summary['latest']['close']:.5g} on {summary['latest']['date']}\n"
+               f"{pos_line}\n"
+               f"https://prophetcharts.up.railway.app/")
+    try:
+        # Discord's API 403s requests with no (or a generic) User-Agent --
+        # it's behind bot detection that urllib's default UA trips.
+        req = urllib.request.Request(
+            DISCORD_WEBHOOK_URL, data=json.dumps({"content": content}).encode(),
+            headers={"Content-Type": "application/json",
+                     "User-Agent": "Prophet-Dashboard (https://prophetcharts.up.railway.app, 1.0)"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=10).read()
+        log.info(f"Sent Discord alert: {symbol} {tf} {kind}")
+    except Exception:
+        log.exception(f"Failed to send Discord alert for {symbol} {tf} {kind}")
+
+
+def _check_alert(symbol: str, tf: str, summary: dict) -> None:
+    latest = summary["latest"]
+    key = (symbol, tf)
+    state = _alert_state.get(key) or {}
+    if state.get("date") != latest["date"]:
+        state = {"date": latest["date"], "green": False, "red": False}
+
+    for kind in ("green", "red"):
+        if latest[f"{kind}_dot"] and not state[kind]:
+            state[kind] = True
+            if _alerts_armed:
+                _send_discord_alert(symbol, tf, kind, summary)
+    _alert_state[key] = state
 
 
 def _refresh_one(symbol: str, tf: str) -> None:
@@ -49,6 +109,7 @@ def _refresh_one(symbol: str, tf: str) -> None:
                 "html": chart_html, "summary": summary, "error": None,
                 "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             }
+        _check_alert(symbol, tf, summary)
         log.info(f"Refreshed {symbol} {tf}: {summary}")
     except Exception as e:
         log.exception(f"Failed to refresh {symbol} {tf}")
@@ -78,7 +139,11 @@ def startup() -> None:
     # is listening -- blocking here just turns that window into 502s. The
     # dashboard already renders a "Loading..." state for uncached entries.
     def _populate_then_loop():
-        _refresh_all()
+        global _alerts_armed
+        _refresh_all()  # seed _alert_state from whatever's already on the latest bar; no alerts sent yet
+        _alerts_armed = True
+        log.info("Alerts armed; future new dots will notify Discord" if DISCORD_WEBHOOK_URL
+                  else "DISCORD_WEBHOOK_URL not set; alerts disabled")
         _refresh_loop()
     threading.Thread(target=_populate_then_loop, daemon=True).start()
 
@@ -107,6 +172,10 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .stat {{ background:#20242e; border-radius:6px; padding:8px 14px; }}
   .stat b {{ color:#8FC7FF; }}
   .err {{ color:#ff6b6b; font-size:13px; }}
+  .status {{ border-radius:8px; padding:10px 14px; margin-bottom:14px; font-size:14px; font-weight:600; }}
+  .status.open {{ background:#1a3326; color:#7ee0a5; border:1px solid #2d5c40; }}
+  .status.flat {{ background:#20242e; color:#999; border:1px solid #2a2e38; }}
+  .status.signal {{ background:#3a1e1e; color:#ff8a8a; border:1px solid #5c2d2d; }}
 
   .tabs {{ display:flex; flex-wrap:wrap; gap:8px; margin-bottom:16px; }}
   .tab-btn {{
@@ -217,6 +286,25 @@ TF_PANEL_TEMPLATE = """<div class="tf-panel" id="tfpanel-{slug}-{tf}" style="dis
 </div>"""
 
 
+def _status_banner(summary: dict) -> str:
+    latest = summary["latest"]
+    pos = summary.get("position")
+    if latest["red_dot"]:
+        note = " &mdash; sell signal on the latest bar" + (" (closes the open position)" if pos else " (no open position to close)")
+        cls, text = "signal", f"&#128721; Red dot {latest['date']} @ {latest['close']:.5g}{note}"
+    elif latest["green_dot"]:
+        note = " &mdash; buy signal on the latest bar" + (" (already in position)" if pos else "")
+        cls, text = "signal", f"&#128994; Green dot {latest['date']} @ {latest['close']:.5g}{note}"
+    elif pos:
+        stop_txt = f", stop {pos['stop']:.5g}" if pos["stop"] is not None else ""
+        text = f"In position since {pos['entry_t'][:10]} @ {pos['entry_px']:.5g}{stop_txt} &mdash; watching for the next red dot"
+        cls = "open"
+    else:
+        text = "No open position &mdash; watching for the next green dot"
+        cls = "flat"
+    return f'<div class="status {cls}">{text}</div>'
+
+
 def _stats_row(summary: dict | None, error: str | None) -> str:
     if error and not summary:
         return f'<div class="err">Error: {html.escape(error)}</div>'
@@ -233,7 +321,7 @@ def _stats_row(summary: dict | None, error: str | None) -> str:
         items.append(("Win rate", f"{summary['win_rate_pct']}%"))
     stats = "".join(f'<div class="stat">{label}: <b>{val}</b></div>' for label, val in items)
     warn = f'<div class="err">Last refresh error (showing stale data): {html.escape(error)}</div>' if error else ""
-    return f'<div class="stats">{stats}</div>{warn}'
+    return f'{_status_banner(summary)}<div class="stats">{stats}</div>{warn}'
 
 
 @app.get("/", response_class=HTMLResponse)

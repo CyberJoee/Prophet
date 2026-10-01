@@ -72,8 +72,15 @@ def _refresh_loop() -> None:
 
 @app.on_event("startup")
 def startup() -> None:
-    _refresh_all()  # populate cache before serving so the first page load isn't empty
-    threading.Thread(target=_refresh_loop, daemon=True).start()
+    # Fetch in the background rather than blocking startup: with several
+    # symbols/timeframes this can take 30-60s, and Railway (and any other
+    # platform health check) starts routing traffic as soon as the process
+    # is listening -- blocking here just turns that window into 502s. The
+    # dashboard already renders a "Loading..." state for uncached entries.
+    def _populate_then_loop():
+        _refresh_all()
+        _refresh_loop()
+    threading.Thread(target=_populate_then_loop, daemon=True).start()
 
 
 PAGE_TEMPLATE = """<!DOCTYPE html>

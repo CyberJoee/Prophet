@@ -15,6 +15,7 @@ import logging
 import os
 import threading
 import time
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
@@ -22,6 +23,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
 from app.chart import build_html
+from app.news import fetch_news
 from app.strategy import Params, run
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -38,6 +40,7 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
 # this fast flip constantly and would spam the channel; weekly is the one
 # worth getting pushed for. Still configurable in case that changes.
 ALERT_TIMEFRAMES = {t.strip() for t in os.environ.get("ALERT_TIMEFRAMES", "1w").split(",") if t.strip()}
+NEWS_REFRESH_SECONDS = int(os.environ.get("NEWS_REFRESH_SECONDS", 10 * 60))
 if DISCORD_WEBHOOK_URL.startswith("https://discordapp.com/"):
     # Legacy domain; discord.com is the current one and the one that's been
     # verified to work reliably with a plain urllib request.
@@ -48,6 +51,12 @@ app = FastAPI(title="Prophet")
 # cache[(symbol, tf)] = {"html": str, "summary": dict, "updated_at": iso str, "error": str|None}
 _cache: dict[tuple[str, str], dict] = {}
 _cache_lock = threading.Lock()
+
+# news_cache[symbol] = {"items": [...], "updated_at": iso str, "error": str|None}
+# Keyed by symbol only (not symbol+tf) -- news isn't timeframe-specific, so it
+# refreshes and renders independently of which chart timeframe is active.
+_news_cache: dict[str, dict] = {}
+_news_lock = threading.Lock()
 
 # alert_state[(symbol, tf)] = {"date": "2026-09-30", "green": bool, "red": bool}
 # Tracks which dot signals we've already alerted on for the current latest
@@ -137,6 +146,31 @@ def _refresh_loop() -> None:
         _refresh_all()
 
 
+def _refresh_news_one(symbol: str) -> None:
+    try:
+        items = fetch_news(symbol)
+        with _news_lock:
+            _news_cache[symbol] = {"items": items, "error": None,
+                                    "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+    except Exception as e:
+        log.exception(f"Failed to refresh news for {symbol}")
+        with _news_lock:
+            prev = _news_cache.get(symbol, {})
+            _news_cache[symbol] = {**prev, "error": str(e),
+                                    "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+
+
+def _refresh_news_all() -> None:
+    for symbol in SYMBOLS:
+        _refresh_news_one(symbol)
+
+
+def _refresh_news_loop() -> None:
+    while True:
+        time.sleep(NEWS_REFRESH_SECONDS)
+        _refresh_news_all()
+
+
 @app.on_event("startup")
 def startup() -> None:
     # Fetch in the background rather than blocking startup: with several
@@ -152,6 +186,7 @@ def startup() -> None:
                   else "DISCORD_WEBHOOK_URL not set; alerts disabled")
         _refresh_loop()
     threading.Thread(target=_populate_then_loop, daemon=True).start()
+    threading.Thread(target=lambda: (_refresh_news_all(), _refresh_news_loop()), daemon=True).start()
 
 
 TF_LABELS = {"1d": "Day", "3d": "3-Day", "1w": "Week", "1M": "Month"}
@@ -199,12 +234,42 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
   .tf-btn.active {{ background:#20242e; color:#eee; border-color:#444; }}
   .tf-btn:hover {{ color:#eee; }}
 
+  .news {{ margin-top:18px; padding-top:16px; border-top:1px solid #262a33; }}
+  .news-head {{ display:flex; align-items:center; gap:8px; margin-bottom:10px; }}
+  .news-head h3 {{ font-size:14px; font-weight:700; color:#ccc; margin:0; text-transform:uppercase; letter-spacing:.04em; }}
+  .news-updated {{ color:#666; font-size:11px; margin-left:auto; }}
+  .news-list {{ display:flex; flex-direction:column; gap:8px; }}
+  .news-item {{
+    display:flex; align-items:flex-start; gap:10px; background:#1e222b; border:1px solid #262a33;
+    border-left:3px solid #2a2e38; border-radius:8px; padding:10px 12px; text-decoration:none;
+    transition:transform .08s ease, background .08s ease, border-color .08s ease;
+  }}
+  .news-item:hover {{ background:#242933; transform:translateX(2px); border-color:#3a3f4b; }}
+  .news-item.major {{
+    border-left-color:#ff8a3d; background:linear-gradient(90deg, rgba(255,138,61,0.10), #1e222b 18%);
+  }}
+  .news-item.major:hover {{ border-left-color:#ffa865; }}
+  .news-favicon {{ width:18px; height:18px; border-radius:4px; margin-top:2px; flex-shrink:0; background:#2a2e38; }}
+  .news-body {{ min-width:0; flex:1; }}
+  .news-title {{ color:#e8e8e8; font-size:13.5px; line-height:1.35; font-weight:500; }}
+  .news-item:hover .news-title {{ color:#fff; }}
+  .news-meta {{ display:flex; align-items:center; gap:6px; margin-top:4px; font-size:11.5px; color:#888; }}
+  .news-source {{ color:#8FC7FF; font-weight:600; }}
+  .news-badge {{
+    display:inline-flex; align-items:center; gap:3px; background:rgba(255,138,61,0.18); color:#ffa865;
+    border-radius:10px; padding:1px 8px; font-size:10.5px; font-weight:700; letter-spacing:.03em;
+    text-transform:uppercase; flex-shrink:0; margin-top:1px;
+  }}
+  .news-empty {{ color:#666; font-size:13px; padding:8px 2px; }}
+
   @media (max-width: 480px) {{
     body {{ padding:12px; }}
     h1 {{ font-size:22px; }}
     .card {{ padding:10px; border-radius:8px; }}
     .stat {{ padding:6px 10px; font-size:13px; }}
     .tab-btn {{ padding:8px 14px; font-size:14px; }}
+    .news-title {{ font-size:13px; }}
+    .news-item {{ padding:9px 10px; }}
   }}
 </style>
 </head>
@@ -284,6 +349,7 @@ function resizeChartsIn(sym, tf) {{
 SYMBOL_PANEL_TEMPLATE = """<div class="symbol-panel card" id="panel-{slug}" data-sym="{slug}" style="display:none;">
   <div class="tf-tabs">{tf_tabs}</div>
   {tf_panels}
+  {news_html}
 </div>"""
 
 TF_PANEL_TEMPLATE = """<div class="tf-panel" id="tfpanel-{slug}-{tf}" style="display:none;">
@@ -330,6 +396,57 @@ def _stats_row(summary: dict | None, error: str | None) -> str:
     return f'{_status_banner(summary)}<div class="stats">{stats}</div>{warn}'
 
 
+def _relative_time(iso_ts: str | None) -> str:
+    if not iso_ts:
+        return ""
+    try:
+        t = datetime.fromisoformat(iso_ts)
+    except ValueError:
+        return ""
+    secs = (datetime.now(timezone.utc) - t).total_seconds()
+    if secs < 60:
+        return "just now"
+    if secs < 3600:
+        return f"{int(secs // 60)}m ago"
+    if secs < 86400:
+        return f"{int(secs // 3600)}h ago"
+    return f"{int(secs // 86400)}d ago"
+
+
+def _news_section_html(symbol: str) -> str:
+    with _news_lock:
+        entry = _news_cache.get(symbol)
+    items = (entry or {}).get("items") or []
+    updated = _relative_time((entry or {}).get("updated_at"))
+
+    if not items:
+        body = '<div class="news-empty">No recent headlines found&hellip;</div>' if entry else \
+               '<div class="news-empty">Loading&hellip;</div>'
+    else:
+        cards = []
+        for it in items:
+            domain = urllib.parse.urlparse(it.get("source_url") or "").netloc or ""
+            favicon = f"https://www.google.com/s2/favicons?domain={domain}&sz=32" if domain else ""
+            cls = "news-item major" if it.get("major") else "news-item"
+            badge = '<span class="news-badge">&#128293; Major</span>' if it.get("major") else ""
+            fav_img = f'<img class="news-favicon" src="{favicon}" alt="" loading="lazy">' if favicon else \
+                       '<div class="news-favicon"></div>'
+            cards.append(
+                f'<a class="{cls}" href="{html.escape(it["link"])}" target="_blank" rel="noopener noreferrer">'
+                f'{fav_img}'
+                f'<div class="news-body">'
+                f'<div class="news-title">{html.escape(it["title"])}</div>'
+                f'<div class="news-meta"><span class="news-source">{html.escape(it.get("source") or "")}</span>'
+                f'<span>&middot; {_relative_time(it.get("published"))}</span>{badge}</div>'
+                f'</div></a>'
+            )
+        body = f'<div class="news-list">{"".join(cards)}</div>'
+
+    err = f'<div class="err">News error: {html.escape(entry["error"])}</div>' if entry and entry.get("error") else ""
+    return (f'<div class="news"><div class="news-head"><h3>&#128240; News</h3>'
+            f'<span class="news-updated">{("updated " + updated) if updated else ""}</span></div>{err}{body}</div>')
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard() -> str:
     with _cache_lock:
@@ -356,6 +473,7 @@ def dashboard() -> str:
 
         symbol_panels.append(SYMBOL_PANEL_TEMPLATE.format(
             slug=slug, tf_tabs="".join(tf_tabs), tf_panels="\n".join(tf_panels),
+            news_html=_news_section_html(symbol),
         ))
 
     return PAGE_TEMPLATE.format(

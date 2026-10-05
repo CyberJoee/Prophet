@@ -23,6 +23,13 @@ chart; built to add more symbols over time.
   timeframe on an interval and caches the rendered chart HTML in memory; the
   `/` route just serves the latest cached render, so page loads are instant
   and the page itself auto-refreshes on a meta tag to pick up new data.
+  A second background thread refreshes a news feed per symbol the same way.
+- `app/news.py` -- per-symbol news via Google News' free RSS search (no API
+  key; CryptoPanic and CryptoCompare's news APIs both require a paid key).
+  Headlines get flagged "Major" by a simple heuristic (market-reaction verbs
+  like "surges"/"plunges", or keywords like "partnership"/"ETF"/"hack") so a
+  real catalyst (e.g. a coin jumping on a surprise partnership announcement)
+  stands out from routine price-watch posts, without hiding the rest.
 
 ## Strategy spec
 
@@ -67,6 +74,9 @@ Open http://localhost:8000
 | `SINCE` | `2021-01-01` | Backtest/chart start date |
 | `EXCHANGE` | `coinbase` | Primary exchange; auto-backfills from others if it doesn't cover `SINCE` |
 | `REFRESH_SECONDS` | `900` | How often the background job recomputes and the page auto-reloads |
+| `NEWS_REFRESH_SECONDS` | `600` | How often the per-symbol news feed refreshes |
+| `DISCORD_WEBHOOK_URL` | unset | Discord webhook for new-signal alerts; disabled if unset |
+| `ALERT_TIMEFRAMES` | `1w` | Comma-separated timeframes that actually fire Discord alerts |
 
 ## Deploy (Railway)
 

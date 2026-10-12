@@ -57,32 +57,22 @@ def _is_major(title: str) -> bool:
     return bool(_MAJOR_RE.search(title)) or bool(_MAJOR_KEYWORDS_RE.search(title))
 
 
-def fetch_news(symbol: str, limit: int = 12) -> list[dict]:
-    """symbol like 'HBAR/USD'. Returns newest-first list of
-    {title, link, source, source_url, published, major} dicts."""
-    base = symbol.split("/")[0]
-    query = f"{COIN_NAMES.get(base, base)} {base} crypto"
+def _search(query: str) -> list[dict]:
+    """One Google News RSS search -> raw parsed items (unfiltered, undeduped)."""
     url = "https://news.google.com/rss/search?q=" + urllib.parse.quote(query) + "&hl=en-US&gl=US&ceid=US:en"
-
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; ProphetNewsBot/1.0)"})
     body = urllib.request.urlopen(req, timeout=15).read()
     root = ET.fromstring(body)
 
-    items = []
-    seen_titles = set()
+    out = []
     for item in root.iter("item"):
         title_raw = (item.findtext("title") or "").strip()
         source_el = item.find("source")
         source = (source_el.text or "").strip() if source_el is not None else ""
         source_url = source_el.get("url", "") if source_el is not None else ""
         title = _strip_source_suffix(title_raw, source)
-        # Normalize away punctuation/whitespace differences for the dedupe
-        # key only (keeps the real title intact for display) -- aggregators
-        # often run the same story with a comma or an "and" vs "&" different.
-        dedup_key = re.sub(r"[^a-z0-9]+", "", title.lower())
-        if not title or dedup_key in seen_titles or _SPAM_RE.match(title):
-            continue  # dedupe near-identical stories across aggregators + drop converter spam
-        seen_titles.add(dedup_key)
+        if not title:
+            continue
 
         pub_raw = item.findtext("pubDate")
         try:
@@ -90,13 +80,68 @@ def fetch_news(symbol: str, limit: int = 12) -> list[dict]:
         except Exception:
             published = None
 
-        items.append({
+        out.append({
             "title": title, "link": item.findtext("link") or "",
             "source": source, "source_url": source_url,
             "published": published.isoformat() if published else None,
             "published_ts": published.timestamp() if published else 0,
             "major": _is_major(title),
         })
+    return out
+
+
+# Separate, narrow risk queries -- not one compound "A OR B OR C" query.
+# Google News RSS doesn't honor boolean OR as a real filter; a long
+# keyword-stuffed query just gets relevance-ranked as a bag of words, which
+# diluted results enough that a live $52M lawsuit against Hedera never
+# surfaced even over 80 results. The same two-word query run alone
+# ("Hedera lawsuit") found it as the #1 result. One request per category
+# costs more HTTP calls but is the only way that actually works.
+RISK_QUERY_SUFFIXES = ["lawsuit", "SEC charges", "hack OR exploit", "regulation"]
+
+
+def fetch_news(symbol: str, limit: int = 12) -> list[dict]:
+    """symbol like 'HBAR/USD'. Returns newest-first list of
+    {title, link, source, source_url, published, major} dicts.
+
+    Runs a general "latest about this coin" query plus several narrow,
+    separate legal/regulatory/security queries. A general query alone misses
+    whole categories of real news: routine price-watch posts dominate its
+    ranking and crowd out the comparatively rare but far more consequential
+    legal/security stories (see RISK_QUERY_SUFFIXES comment above).
+    """
+    base = symbol.split("/")[0]
+    name = COIN_NAMES.get(base, base)
+    # Always include the ticker, not just the name, even in risk queries --
+    # a name-only query ("Stellar hack") is one word away from matching
+    # totally unrelated stories for any coin whose name is also a common
+    # word or brand (caught "Stellar" matching an ASOS retailer hack story
+    # in testing, which the ticker disambiguates).
+    queries = [f"{name} {base} crypto"] + [f"{name} {base} {suffix}" for suffix in RISK_QUERY_SUFFIXES]
+
+    seen_titles = set()
+    items = []
+    for q in queries:
+        try:
+            results = _search(q)
+        except Exception:
+            log.exception(f"News query failed for {symbol!r}: {q!r}")
+            continue
+        for it in results:
+            dedup_key = re.sub(r"[^a-z0-9]+", "", it["title"].lower())
+            if dedup_key in seen_titles or _SPAM_RE.match(it["title"]):
+                continue  # dedupe near-identical stories across queries/aggregators + drop converter spam
+            seen_titles.add(dedup_key)
+            items.append(it)
 
     items.sort(key=lambda x: x["published_ts"], reverse=True)
-    return items[:limit]
+
+    # A pure recency cutoff can still bury a major story under a flood of
+    # same-day routine price-watch posts from the general query. Guarantee
+    # recent majors always make the list, instead of only ever getting in by
+    # winning a date-sort tiebreak against noise.
+    top = items[:limit]
+    extra_majors = [it for it in items[limit:] if it["major"]][:6]
+    if extra_majors:
+        top = sorted(top + extra_majors, key=lambda x: x["published_ts"], reverse=True)
+    return top
